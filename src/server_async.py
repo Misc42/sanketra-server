@@ -725,6 +725,12 @@ class _UdpInputProtocol(asyncio.DatagramProtocol):
             if _check_any_token(token):
                 _udp_authed_clients[addr] = True
                 log_info(f"[UDP] Client authenticated: {addr[0]}:{addr[1]}")
+                # Send ACK so Android knows UDP is working (fire-and-forget)
+                try:
+                    ack = b'{"t":"ack"}'
+                    _udp_transport.sendto(ack, addr)
+                except Exception:
+                    pass
             else:
                 log_warning(f"[UDP] Auth failed from {addr[0]}:{addr[1]}")
             return
@@ -733,13 +739,18 @@ class _UdpInputProtocol(asyncio.DatagramProtocol):
         if addr not in _udp_authed_clients:
             return
 
-        # Dispatch input event (same as trackpad WebSocket handler)
-        if t == "a":
-            mouse_move_absolute(msg.get("x", 0), msg.get("y", 0))
-        elif t == "m":
-            mouse_move(msg.get("x", 0), msg.get("y", 0))
-        elif t == "s":
-            mouse_scroll(msg.get("dy", 0) * 0.1)
+        # Resume app input on any UDP activity (matches WSS path at ws_trackpad)
+        if is_app_input_paused():
+            resume_app_input()
+
+        # Route through the same _tp_queue + worker thread as WSS.
+        # Calling mouse_move() directly here blocks the asyncio event loop
+        # (pynput SendInput on Windows can take 1-2ms) and skips coalescing.
+        _ensure_tp_thread()
+        try:
+            _tp_queue.put_nowait(msg)
+        except queue.Full:
+            pass  # Drop under overload — UDP semantics, loss is expected
 
     def connection_lost(self, exc):
         log_info("[UDP] Input listener closed")
@@ -783,7 +794,7 @@ def _tp_worker():
                 if drained:
                     log_debug(f"[Trackpad] scroll-stop: drained {drained} continuous events")
 
-            msg = _tp_queue.get(timeout=0.1)
+            msg = _tp_queue.get(timeout=0.005)
             if msg is None:
                 break
             t = msg.get("t")

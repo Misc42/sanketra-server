@@ -261,7 +261,8 @@ class PhysicalInputMonitor:
 # When our app generates input via pynput, mark_app_output() is called.
 # The monitor ignores events within _APP_OUTPUT_WINDOW of the last mark.
 _last_app_output_time = 0.0
-_APP_OUTPUT_WINDOW = 0.15  # 150ms grace period
+_APP_OUTPUT_WINDOW = 0.25  # 250ms grace period — pynput listener callbacks on Windows
+# can be delayed 200ms+ under load; 150ms caused false physical-input triggers
 
 
 def mark_app_output():

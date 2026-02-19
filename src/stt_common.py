@@ -1996,6 +1996,9 @@ def _ensure_mouse_pos():
         _mouse_pos = _get_initial_mouse_pos()
 _pending_move = {'dx': 0, 'dy': 0, 'last_send': 0}
 _MOVE_THROTTLE_MS = 33  # ~30fps - balance between smoothness and performance
+# Sub-pixel accumulator for Windows/macOS — prevents int() truncation from eating
+# small movements. Accumulates fractional remainders across calls.
+_move_accum = {'x': 0.0, 'y': 0.0}
 
 _ydotool_sudo_setup_done = False
 
@@ -2083,31 +2086,31 @@ def mouse_move(dx, dy):
     if is_app_input_paused():
         return
     _ensure_mouse_pos()
-    global _mouse_pos, _pending_move
-
-    dx = int(dx * TRACKPAD_SENSITIVITY)
-    dy = int(dy * TRACKPAD_SENSITIVITY)
+    global _mouse_pos, _pending_move, _move_accum
 
     if PLATFORM == 'linux':
+        # Linux paths use int directly (Xlib/uinput work with integer deltas)
+        dx_i = int(dx * TRACKPAD_SENSITIVITY)
+        dy_i = int(dy * TRACKPAD_SENSITIVITY)
         display = get_display_server()
 
         # X11: direct Xlib with flush (fastest), fallback to pynput, then xdotool
         if display == 'x11':
-            if _init_xlib() and _xlib_mouse_move(dx, dy):
+            if _init_xlib() and _xlib_mouse_move(dx_i, dy_i):
                 return
             # Fallback to pynput
             mouse = _get_pynput_mouse()
             if mouse:
-                mouse.move(dx, dy)
+                mouse.move(dx_i, dy_i)
                 return
             # Fallback to xdotool
-            subprocess.run(['xdotool', 'mousemove_relative', '--', str(dx), str(dy)], check=False)
+            subprocess.run(['xdotool', 'mousemove_relative', '--', str(dx_i), str(dy_i)], check=False)
             return
 
         # Wayland: use uinput (needs permissions) or ydotool
         if _init_uinput() and _uinput_fd:
-            _write_uinput_event(_EV_REL, _REL_X, dx)
-            _write_uinput_event(_EV_REL, _REL_Y, dy)
+            _write_uinput_event(_EV_REL, _REL_X, dx_i)
+            _write_uinput_event(_EV_REL, _REL_Y, dy_i)
             _uinput_syn()
             return
 
@@ -2117,8 +2120,8 @@ def mouse_move(dx, dy):
             return
 
         if tool in ('ydotool', 'ydotool-sudo'):
-            _pending_move['dx'] += dx
-            _pending_move['dy'] += dy
+            _pending_move['dx'] += dx_i
+            _pending_move['dy'] += dy_i
             now = _time.time() * 1000
             if now - _pending_move['last_send'] < _MOVE_THROTTLE_MS:
                 return
@@ -2130,11 +2133,20 @@ def mouse_move(dx, dy):
             _pending_move['dy'] = 0
             _pending_move['last_send'] = now
     else:
-        # Windows / macOS
+        # Windows / macOS — sub-pixel accumulator prevents int() truncation
+        # from eating slow/precise movements (e.g. 0.3px * 1.5 = 0.45 → 0 without accum)
+        _move_accum['x'] += dx * TRACKPAD_SENSITIVITY
+        _move_accum['y'] += dy * TRACKPAD_SENSITIVITY
+        dx_i = int(_move_accum['x'])
+        dy_i = int(_move_accum['y'])
+        if dx_i == 0 and dy_i == 0:
+            return  # Accumulate more before dispatching
+        _move_accum['x'] -= dx_i
+        _move_accum['y'] -= dy_i
         mouse = _get_pynput_mouse()
         if mouse:
             _mark_app_output()
-            mouse.move(dx, dy)
+            mouse.move(dx_i, dy_i)
 
 def mouse_move_absolute(x, y):
     """Move cursor to absolute screen position — for gyro pointer"""

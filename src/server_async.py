@@ -244,6 +244,8 @@ FRAME_SAMPLES = 512      # 32ms
 FRAME_BYTES = 1024       # 512 samples * 2 bytes (int16)
 MAX_BUFFER_SECONDS = 30
 MAX_BUFFER_FRAMES = int(MAX_BUFFER_SECONDS * SAMPLE_RATE / FRAME_SAMPLES)
+MAX_SPEECH_SECONDS = 8  # Force-transcribe after 8s continuous speech
+MAX_SPEECH_FRAMES = int(MAX_SPEECH_SECONDS * SAMPLE_RATE / FRAME_SAMPLES)
 
 # Heartbeat
 HEARTBEAT_INTERVAL = 15  # seconds
@@ -486,7 +488,7 @@ async def run_inference(session: StreamingSession, ws: WebSocket):
         session.pending_inference = False
         session.reset_vad()
 
-PARTIAL_INTERVAL = 2.0  # seconds between partial transcripts
+PARTIAL_INTERVAL = 1.0  # seconds between partial transcripts
 
 async def run_partial_inference(session: StreamingSession, ws: WebSocket):
     """Run interim transcription without resetting buffer or typing text"""
@@ -577,6 +579,11 @@ async def handle_audio_frame(session: StreamingSession, ws: WebSocket, payload: 
         # 500ms silence -> transcribe
         if session.silence_frames >= STREAMING_SILENCE_THRESHOLD:
             await run_inference(session, ws)
+
+    # Force-transcribe if buffer exceeds 8s continuous speech
+    if session.had_speech and not session.pending_inference and len(session.audio_buffer) >= MAX_SPEECH_FRAMES:
+        log_debug(f"[Stream] Buffer cap hit ({MAX_SPEECH_SECONDS}s), force-transcribing")
+        await run_inference(session, ws)
 
     # Backpressure: if inference running and buffer growing
     if session.pending_inference and len(session.audio_buffer) > MAX_BUFFER_FRAMES // 2:

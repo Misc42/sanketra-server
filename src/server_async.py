@@ -807,7 +807,20 @@ def _tp_worker():
                 # user tapped a button) and fall through to dispatch
                 resume_app_input(force=True)
             if t == "m":
-                mouse_move(msg["x"], msg["y"])
+                # Coalesce: sum up queued relative moves into one dispatch
+                total_x, total_y = msg["x"], msg["y"]
+                while not _tp_queue.empty():
+                    try:
+                        peek = _tp_queue.get_nowait()
+                        if peek.get("t") == "m":
+                            total_x += peek["x"]
+                            total_y += peek["y"]
+                        else:
+                            _tp_queue.put(peek)
+                            break
+                    except queue.Empty:
+                        break
+                mouse_move(total_x, total_y)
             elif t == "a":
                 # Coalesce: skip to latest absolute position (intermediate ones are stale)
                 while not _tp_queue.empty():

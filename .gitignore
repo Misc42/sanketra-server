@@ -1,0 +1,16 @@
+vosk-model-*
+*.zip
+cert.pem
+key.pem
+__pycache__/
+*.pyc
+Nirmala-Sitaraman-Tax-Meme-1014x1024.webp
+
+# Setup generated
+venv/
+
+# Logs
+logs/*.log
+
+# macOS
+.DS_Store

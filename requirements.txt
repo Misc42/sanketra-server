@@ -1,0 +1,34 @@
+# Core
+faster-whisper>=1.0.0
+sounddevice>=0.4.5
+numpy>=1.24.0
+scipy>=1.10.0
+torch>=2.0.0
+
+# GPU monitoring (optional - graceful fallback if not available)
+nvidia-ml-py>=12.0.0; sys_platform != "darwin"
+
+# System info for model selection
+psutil>=5.9.0
+
+# Web interface (Flask - legacy)
+flask>=3.0.0
+flask-sock>=0.7.0
+qrcode>=7.0
+cryptography>=41.0.0
+
+# Web interface (FastAPI - async)
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+
+# Cross-platform typing/mouse
+# Linux X11: pynput (fast, no perms) | Wayland: uinput/ydotool
+pyautogui>=0.9.0; sys_platform == "win32" or sys_platform == "darwin"
+pynput>=1.7.6
+
+# Clipboard paste fallback for non-ASCII text when pynput fails
+pyperclip>=1.8.0
+
+# macOS input control (Quartz event posting, screen resolution)
+pyobjc-framework-Quartz>=9.0; sys_platform == "darwin"

@@ -4133,7 +4133,6 @@ if __name__ == "__main__":
             print(f"  To disable AirPlay Receiver: System Settings > General > AirDrop & Handoff > AirPlay Receiver OFF")
 
     SERVER_PORT = port
-    global _udp_port
     _udp_port = port + 1  # Sideband UDP port always one above HTTP port
     url = f"https://{ip}:{port}?token={AUTH_TOKEN}"
 

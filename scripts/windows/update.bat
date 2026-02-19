@@ -1,12 +1,12 @@
 @echo off
-REM mic_on_term - Update script (Windows)
+REM Sanketra - Update script (Windows)
 
 set SCRIPT_DIR=%~dp0
 set ROOT_DIR=%SCRIPT_DIR%..\..\
 cd /d "%ROOT_DIR%"
 
 echo.
-echo   Updating mic_on_term...
+echo   Updating Sanketra...
 echo   -------------------------
 echo.
 

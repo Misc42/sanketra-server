@@ -1,12 +1,12 @@
 #!/bin/bash
-# mic_on_term - Update script (Linux/Mac)
+# Sanketra - Update script (Linux/Mac)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT_DIR"
 
 echo ""
-echo "  Updating mic_on_term..."
+echo "  Updating Sanketra..."
 echo "  ─────────────────────────"
 echo ""
 

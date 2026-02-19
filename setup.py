@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mic_on_term Setup Script
+Sanketra Setup Script
 Usage: python3 setup.py [--uninstall]
 """
 
@@ -435,7 +435,7 @@ def install():
     start = time.time()
 
     print(f"""
-  {C.B}mic_on_term{C.E} {C.D}installer{C.E}
+  {C.B}Sanketra{C.E} {C.D}installer{C.E}
   {C.D}─────────────────────{C.E}
 """)
 
@@ -514,7 +514,7 @@ def install():
 """)
 
 def uninstall():
-    print(f"\n  {C.B}mic_on_term{C.E} {C.D}uninstall{C.E}\n")
+    print(f"\n  {C.B}Sanketra{C.E} {C.D}uninstall{C.E}\n")
 
     removed = []
     freed = 0
@@ -533,21 +533,21 @@ def uninstall():
     # 1. Stop and remove service
     plat = get_platform()
     if plat == 'linux':
-        run("systemctl --user stop mic_on_term 2>/dev/null")
-        run("systemctl --user disable mic_on_term 2>/dev/null")
-        service_path = os.path.expanduser("~/.config/systemd/user/mic_on_term.service")
+        run("systemctl --user stop sanketra 2>/dev/null")
+        run("systemctl --user disable sanketra 2>/dev/null")
+        service_path = os.path.expanduser("~/.config/systemd/user/sanketra.service")
         if os.path.exists(service_path):
             os.remove(service_path)
             run("systemctl --user daemon-reload")
             removed.append("systemd service")
     elif plat == 'windows':
-        run('schtasks /end /tn "mic_on_term" 2>nul')
-        run('schtasks /delete /tn "mic_on_term" /f 2>nul')
+        run('schtasks /end /tn "sanketra" 2>nul')
+        run('schtasks /delete /tn "sanketra" /f 2>nul')
         # Remove firewall rules
         subprocess.run(['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
-                        'name=mic_on_term'], capture_output=True, check=False)
+                        'name=sanketra'], capture_output=True, check=False)
         subprocess.run(['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
-                        'name=mic_on_term UDP'], capture_output=True, check=False)
+                        'name=sanketra UDP'], capture_output=True, check=False)
         removed.append("scheduled task")
     elif plat == 'macos':
         plist_path = os.path.expanduser("~/Library/LaunchAgents/com.miconterm.server.plist")
@@ -562,8 +562,8 @@ def uninstall():
         shutil.rmtree(VENV_DIR)
         removed.append("venv")
 
-    # 3. Remove config directory (~/.config/mic_on_term/)
-    config_dir = os.path.expanduser("~/.config/mic_on_term")
+    # 3. Remove config directory (~/.config/sanketra/)
+    config_dir = os.path.expanduser("~/.config/sanketra")
     if os.path.exists(config_dir):
         freed += dir_size(config_dir)
         shutil.rmtree(config_dir)
@@ -621,14 +621,14 @@ def uninstall():
 
     if get_platform() == 'windows':
         home = os.path.expanduser("~")
-        print(f"\n  {C.D}To fully remove, run:{C.E} rmdir /s /q \"{os.path.join(home, 'mic_on_term')}\"")
+        print(f"\n  {C.D}To fully remove, run:{C.E} rmdir /s /q \"{os.path.join(home, 'sanketra')}\"")
         print(f"  {C.D}reinstall:{C.E} python setup.py\n")
     else:
-        print(f"\n  {C.D}To fully remove, run:{C.E} rm -rf ~/mic_on_term")
+        print(f"\n  {C.D}To fully remove, run:{C.E} rm -rf ~/sanketra")
         print(f"  {C.D}reinstall:{C.E} python3 setup.py\n")
 
 def install_service():
-    """Install platform-appropriate background service for mic_on_term"""
+    """Install platform-appropriate background service for Sanketra"""
     plat = get_platform()
     venv_python = get_venv_python()
     server_script = os.path.join(SCRIPT_DIR, "src", "server_async.py")
@@ -637,7 +637,7 @@ def install_service():
         service_dir = os.path.expanduser("~/.config/systemd/user")
         os.makedirs(service_dir, exist_ok=True)
         service_content = f"""[Unit]
-Description=mic_on_term STT Server
+Description=Sanketra Server
 After=network-online.target
 Wants=network-online.target
 
@@ -653,11 +653,11 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 [Install]
 WantedBy=default.target
 """
-        service_path = os.path.join(service_dir, "mic_on_term.service")
+        service_path = os.path.join(service_dir, "sanketra.service")
         with open(service_path, 'w') as f:
             f.write(service_content)
         run("systemctl --user daemon-reload")
-        run("systemctl --user enable mic_on_term")
+        run("systemctl --user enable sanketra")
         return True, service_path
 
     elif plat == 'windows':
@@ -666,19 +666,19 @@ WantedBy=default.target
         venv_pythonw = venv_python.replace('python.exe', 'pythonw.exe')
         task_cmd = f'"{venv_pythonw}" "{server_script}" --service'
         # Delete existing task (ignore errors)
-        run('schtasks /delete /tn "mic_on_term" /f 2>nul')
+        run('schtasks /delete /tn "sanketra" /f 2>nul')
         ok, out = run(
-            f'schtasks /create /tn "mic_on_term" /sc ONLOGON /rl HIGHEST '
+            f'schtasks /create /tn "sanketra" /sc ONLOGON /rl HIGHEST '
             f'/tr "{task_cmd}" /f'
         )
         if ok:
-            # Add firewall rules for mic_on_term (TCP 5000 for HTTP/WS, UDP 5001 for discovery)
+            # Add firewall rules for Sanketra (TCP 5000 for HTTP/WS, UDP 5001 for discovery)
             subprocess.run(['netsh', 'advfirewall', 'firewall', 'add', 'rule',
-                            'name=mic_on_term', 'dir=in', 'action=allow',
+                            'name=sanketra', 'dir=in', 'action=allow',
                             'protocol=TCP', 'localport=5000'],
                            capture_output=True, check=False)
             subprocess.run(['netsh', 'advfirewall', 'firewall', 'add', 'rule',
-                            'name=mic_on_term UDP', 'dir=in', 'action=allow',
+                            'name=sanketra UDP', 'dir=in', 'action=allow',
                             'protocol=UDP', 'localport=5001'],
                            capture_output=True, check=False)
             return True, "Task Scheduler (ONLOGON)"

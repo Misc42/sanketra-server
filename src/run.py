@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mic_on_term Interactive Launcher
+Sanketra Interactive Launcher
 Provides a polished interactive experience for mode and model selection.
 """
 
@@ -143,13 +143,13 @@ def show_header():
     if PLATFORM != 'windows':
         print(f"  {C.D}╔══════════════════════════════════════════════════════════╗{C.E}")
         print(f"  {C.D}║{C.E}                                                          {C.D}║{C.E}")
-        print(f"  {C.D}║{C.E}   {C.B}mic_on_term{C.E}   {C.D}Voice-to-text for terminal{C.E}              {C.D}║{C.E}")
+        print(f"  {C.D}║{C.E}   {C.B}Sanketra{C.E}   {C.D}Voice-to-text for terminal{C.E}              {C.D}║{C.E}")
         print(f"  {C.D}║{C.E}                                                          {C.D}║{C.E}")
         print(f"  {C.D}╚══════════════════════════════════════════════════════════╝{C.E}")
     else:
         print(f"  +============================================================+")
         print(f"  |                                                            |")
-        print(f"  |   {C.B}mic_on_term{C.E}   Voice-to-text for terminal                |")
+        print(f"  |   {C.B}Sanketra{C.E}   Voice-to-text for terminal                |")
         print(f"  |                                                            |")
         print(f"  +============================================================+")
     print()

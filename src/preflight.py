@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Preflight checks for mic_on_term.
+Preflight checks for Sanketra.
 
 This module runs before the application starts to verify dependencies,
 detect hardware capabilities, and select optimal configurations.
@@ -674,7 +674,7 @@ def print_summary(result: PreflightResult, mode: str):
 
     print()
     print("=" * 70)
-    print("                    mic_on_term PREFLIGHT CHECK")
+    print("                    Sanketra PREFLIGHT CHECK")
     print("=" * 70)
     print()
 

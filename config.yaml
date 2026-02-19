@@ -1,6 +1,6 @@
 # NOTE: This file is NOT loaded by the server. It serves as documentation for configuration options.
 #
-# mic_on_term Configuration
+# Sanketra Configuration
 # Speech-to-Text with Hindi/Hinglish support
 
 # ============================================================================
@@ -116,7 +116,7 @@ advanced:
   model_preference: balanced
 
   # Enable debug logging
-  # Creates detailed logs in mic_on_term_YYYY-MM-DD.log
+  # Creates detailed logs in sanketra_YYYY-MM-DD.log
   debug_logging: false
 
   # GPU acceleration

@@ -100,7 +100,7 @@ _SESSION_MAX_COUNT = 50        # Max concurrent sessions
 _SESSION_TTL = 30 * 24 * 3600  # 30 days in seconds
 
 # Config file for service mode
-_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "mic_on_term")
+_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "sanketra")
 _CONFIG_FILE = os.path.join(_CONFIG_DIR, "config.json")
 # Guards all config read-modify-write sequences.
 # P3-6: This is a threading.Lock that may briefly block the asyncio event loop
@@ -111,7 +111,7 @@ _CONFIG_FILE = os.path.join(_CONFIG_DIR, "config.json")
 _config_lock = threading.Lock()
 
 def _load_config():
-    """Load config from ~/.config/mic_on_term/config.json.
+    """Load config from ~/.config/sanketra/config.json.
     Caller MUST hold _config_lock when part of a read-modify-write."""
     if os.path.exists(_CONFIG_FILE):
         try:
@@ -122,7 +122,7 @@ def _load_config():
     return {}
 
 def _save_config(config):
-    """Save config to ~/.config/mic_on_term/config.json.
+    """Save config to ~/.config/sanketra/config.json.
     Caller MUST hold _config_lock when part of a read-modify-write."""
     os.makedirs(_CONFIG_DIR, exist_ok=True)
     with open(_CONFIG_FILE, "w") as f:
@@ -1785,7 +1785,7 @@ async def screen_info(request: Request, token: str = Query(None)):
 @app.get("/api/discover")
 async def api_discover():
     """LAN discovery endpoint — no auth required, returns service identity"""
-    return {"service": "mic_on_term", "name": platform.node(), "port": SERVER_PORT, "udp_port": _udp_port, "os": platform.system(), "server_id": _get_server_id()}
+    return {"service": "sanketra", "name": platform.node(), "port": SERVER_PORT, "udp_port": _udp_port, "os": platform.system(), "server_id": _get_server_id()}
 
 @app.post("/api/pair")
 async def api_pair(request: Request):

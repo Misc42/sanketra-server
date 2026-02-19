@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-REM mic_on_term - Windows launcher
+REM Sanketra - Windows launcher
 REM Background mode for web (trackpad works when minimized)
 
 set SCRIPT_DIR=%~dp0
@@ -54,7 +54,7 @@ exit /b 1
 
 :help
 echo.
-echo   mic_on_term (Windows)
+echo   Sanketra (Windows)
 echo   ---------------------
 echo.
 echo   Usage:

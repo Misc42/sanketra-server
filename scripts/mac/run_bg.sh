@@ -1,5 +1,5 @@
 #!/bin/bash
-# mic_on_term - Background mode (no terminal needed)
+# Sanketra - Background mode (no terminal needed)
 # Use this to run server in background
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -14,7 +14,7 @@ if [ ! -f "$VENV_PYTHON" ]; then
 fi
 
 echo ""
-echo "  Starting mic_on_term in background mode..."
+echo "  Starting Sanketra in background mode..."
 echo "  QR code will open as image - scan it with phone"
 echo ""
 echo "  To stop: pkill -f src/server_async.py"

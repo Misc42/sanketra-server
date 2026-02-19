@@ -23,10 +23,10 @@ import numpy as np
 
 _logger = None
 
-def setup_logging(name="mic_on_term", log_dir=None):
+def setup_logging(name="sanketra", log_dir=None):
     """
     Setup logging to both console and file.
-    Log file: mic_on_term_YYYY-MM-DD.log
+    Log file: sanketra_YYYY-MM-DD.log
     """
     global _logger
 
@@ -60,7 +60,7 @@ def setup_logging(name="mic_on_term", log_dir=None):
         log_dir = os.path.join(root_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
 
-    log_file = os.path.join(log_dir, f"mic_on_term_{datetime.now().strftime('%Y-%m-%d')}.log")
+    log_file = os.path.join(log_dir, f"sanketra_{datetime.now().strftime('%Y-%m-%d')}.log")
 
     try:
         file_handler = RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=3, encoding='utf-8')
@@ -1854,7 +1854,7 @@ def _init_uinput():
         fcntl.ioctl(_uinput_fd, _UI_SET_RELBIT, _REL_WHEEL_HI_RES)
 
         # Create device - uinput_user_dev structure
-        name = b'mic_on_term-mouse'
+        name = b'sanketra-mouse'
         name = name[:_UINPUT_MAX_NAME_SIZE].ljust(_UINPUT_MAX_NAME_SIZE, b'\0')
         # struct uinput_user_dev: name[80], id{bustype,vendor,product,version}, ff_effects_max, absmax[64], absmin[64], absfuzz[64], absflat[64]
         user_dev = name + struct.pack('<HHHHi', 0x03, 0x1234, 0x5678, 1, 0) + b'\0' * (64 * 4 * 4)

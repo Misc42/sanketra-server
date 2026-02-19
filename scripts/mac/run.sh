@@ -1,5 +1,5 @@
 #!/bin/bash
-# mic_on_term - Unified run script
+# Sanketra - Unified run script
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"

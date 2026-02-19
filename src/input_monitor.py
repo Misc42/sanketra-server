@@ -13,7 +13,7 @@ import threading
 import logging
 import time as _time
 
-logger = logging.getLogger("mic_on_term")
+logger = logging.getLogger("sanketra")
 
 # Linux input event constants
 _EV_SYN = 0x00
@@ -30,7 +30,7 @@ _INPUT_EVENT_SIZE = struct.calcsize(_INPUT_EVENT_FORMAT)
 
 # Virtual device name substrings to exclude (our own + common virtual devices)
 _VIRTUAL_DEVICE_NAMES = [
-    'mic_on_term',
+    'sanketra',
     'ydotool',
     'virtual',
     'xdotool',

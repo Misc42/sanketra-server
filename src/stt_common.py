@@ -694,7 +694,7 @@ def get_available_models():
     supports_fp16 = gpu_supports_float16() if has_gpu else False
 
     models = []
-    for name in ["tiny", "base", "small", "medium", "large-v3-turbo", "distil-large-v3", "large-v3"]:
+    for name in ["tiny", "base", "small", "medium", "large-v3-turbo", "distil-large-v3"]:
         vram = MODEL_VRAM[name]
         fits_gpu = (vram["float16"] + INFERENCE_BUFFER_GB) <= vram_free if has_gpu else False
         precision = auto_select_precision(name, vram_free, supports_fp16) if has_gpu else "int8"
@@ -956,7 +956,7 @@ def _lat_color(latency_ms):
 
 def _get_recommended_model(vram_free, models):
     """Get recommended model index using balanced logic."""
-    priority = ["large-v3", "large-v3-turbo", "medium", "small", "base", "tiny"]
+    priority = ["large-v3-turbo", "medium", "small", "base", "tiny"]
     for m in priority:
         if m not in models:
             continue
@@ -981,7 +981,7 @@ def custom_model_selection():
     supports_fp16 = gpu_supports_float16() if has_gpu else False
 
     # distil-large-v3 excluded: English-only model, catastrophic for Hindi/Hinglish target
-    models = ["tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"]
+    models = ["tiny", "base", "small", "medium", "large-v3-turbo"]
     precisions = ["float16", "int8_float16", "int8"]
 
     rec_idx = _get_recommended_model(vram_free, models)

@@ -288,7 +288,10 @@ class StreamingSession:
     frames_processed: int = 0
     last_partial_time: float = 0
     partial_running: bool = False
+    skip_next_partial: bool = False
     _input_health_warned: bool = False
+    # AU-P0-1: Rolling byte buffer for variable-length resampled frames
+    _raw_byte_buf: bytearray = field(default_factory=bytearray)
 
     def reset_vad(self):
         """Reset VAD state after transcription"""
@@ -300,7 +303,10 @@ class StreamingSession:
             self.vad_iterator.reset_states()
 
     def add_audio(self, audio_float: np.ndarray):
-        """Add audio frame to buffer (deque auto-trims at maxlen)"""
+        """Add audio frame to buffer (deque auto-trims oldest at maxlen)"""
+        # AU-P0-2: Log warning when ring buffer is full and dropping oldest frames
+        if len(self.audio_buffer) == self.audio_buffer.maxlen:
+            log_warning("[Stream] Audio ring buffer full — dropping oldest frame (CPU backpressure)")
         self.audio_buffer.append(audio_float)
         self.last_activity = time.time()
         self.frames_processed += 1
@@ -450,6 +456,9 @@ async def run_inference(session: StreamingSession, ws: WebSocket):
         return
 
     session.pending_inference = True
+    # AU-P1-5: Snapshot buffer length before inference so we can preserve
+    # audio that arrives during the await (force-transcribe orphan gap fix)
+    buf_len_at_start = len(session.audio_buffer)
     audio_duration = len(audio) / SAMPLE_RATE
 
     try:
@@ -486,12 +495,27 @@ async def run_inference(session: StreamingSession, ws: WebSocket):
         await send_message(ws, MSG_ERROR, str(e).encode('utf-8'))
     finally:
         session.pending_inference = False
-        session.reset_vad()
+        # AU-P1-5: Preserve audio that arrived during inference (orphan gap fix).
+        # Only remove the frames that were part of the transcribed audio.
+        new_frames_count = len(session.audio_buffer) - buf_len_at_start
+        if new_frames_count > 0:
+            # Keep the new frames that arrived during inference
+            overflow = list(session.audio_buffer)[-new_frames_count:]
+            session.reset_vad()
+            for frame in overflow:
+                session.audio_buffer.append(frame)
+            log_debug(f"[Stream] Preserved {new_frames_count} frames that arrived during inference")
+        else:
+            session.reset_vad()
 
 PARTIAL_INTERVAL = 1.0  # seconds between partial transcripts
 
 async def run_partial_inference(session: StreamingSession, ws: WebSocket):
     """Run interim transcription without resetting buffer or typing text"""
+    # AU-P1-2: Skip partial if flagged (final inference is about to run)
+    if session.skip_next_partial:
+        session.skip_next_partial = False
+        return
     if session.partial_running or session.pending_inference:
         return
     if whisper_model is None:
@@ -505,6 +529,11 @@ async def run_partial_inference(session: StreamingSession, ws: WebSocket):
     session.last_partial_time = time.time()
 
     try:
+        # AU-P1-2: Check skip flag again after acquiring partial_running
+        if session.skip_next_partial:
+            session.skip_next_partial = False
+            return
+
         config = get_preprocessing_config()
         if config.enabled:
             audio = preprocess_audio_buffer(audio, SAMPLE_RATE, config)
@@ -524,13 +553,22 @@ async def run_partial_inference(session: StreamingSession, ws: WebSocket):
         session.partial_running = False
 
 async def handle_audio_frame(session: StreamingSession, ws: WebSocket, payload: bytes):
-    """Process single audio frame"""
-    if len(payload) != FRAME_BYTES:
-        await send_message(ws, MSG_ERROR, f"Expected {FRAME_BYTES} bytes, got {len(payload)}".encode())
-        return
+    """Process single audio frame — accumulates variable-length payloads into fixed-size chunks"""
+    # AU-P0-1: Accumulate incoming bytes into rolling buffer, process in FRAME_BYTES chunks.
+    # Android devices with non-standard sample rates produce different frame sizes after resampling.
+    session._raw_byte_buf.extend(payload)
 
+    while len(session._raw_byte_buf) >= FRAME_BYTES:
+        chunk = bytes(session._raw_byte_buf[:FRAME_BYTES])
+        del session._raw_byte_buf[:FRAME_BYTES]
+
+        await _process_audio_chunk(session, ws, chunk)
+
+
+async def _process_audio_chunk(session: StreamingSession, ws: WebSocket, chunk: bytes):
+    """Process a single fixed-size audio chunk (1024 bytes = 512 samples Int16LE)"""
     # Convert Int16LE to float32
-    audio_int16 = np.frombuffer(payload, dtype=np.int16)
+    audio_int16 = np.frombuffer(chunk, dtype=np.int16)
     audio_float = audio_int16.astype(np.float32) / 32768.0
 
     # POINT C: Apply noise filtering before VAD (preserves energy for VAD accuracy)
@@ -578,11 +616,15 @@ async def handle_audio_frame(session: StreamingSession, ws: WebSocket, payload: 
 
         # 500ms silence -> transcribe
         if session.silence_frames >= STREAMING_SILENCE_THRESHOLD:
+            # AU-P1-2: Skip any pending partial so final inference runs immediately
+            session.skip_next_partial = True
             await run_inference(session, ws)
 
     # Force-transcribe if buffer exceeds 8s continuous speech
     if session.had_speech and not session.pending_inference and len(session.audio_buffer) >= MAX_SPEECH_FRAMES:
         log_debug(f"[Stream] Buffer cap hit ({MAX_SPEECH_SECONDS}s), force-transcribing")
+        # AU-P1-2: Skip any pending partial so final inference runs immediately
+        session.skip_next_partial = True
         await run_inference(session, ws)
 
     # Backpressure: if inference running and buffer growing
@@ -693,6 +735,13 @@ async def ws_audio_stream(ws: WebSocket):
     except Exception as e:
         log_error(f"[Stream] Handler error: {e}")
     finally:
+        # AU-P0-3: On disconnect, run final inference if buffer has speech data
+        if session.audio_buffer and session.had_speech and not session.pending_inference:
+            try:
+                log_info("[Stream] Disconnect flush — transcribing remaining buffered speech")
+                await run_inference(session, ws)
+            except Exception as e:
+                log_debug(f"[Stream] Disconnect flush failed (WS closing): {e}")
         _unregister_ws(ws)
         session.session_active = False
         log_info(f"[Stream] WebSocket handler ended (processed {session.frames_processed} frames)")
@@ -1146,11 +1195,26 @@ async def _auto_unload_timer():
             log_info(f"No WS connections for {int(elapsed)}s — unloading model")
             _unload_model()
 
+def _set_tcp_nodelay_on_server():
+    """N-P0-1: Set TCP_NODELAY on uvicorn's listening sockets to disable Nagle's algorithm.
+    Reduces small-packet latency by 40-200ms for WS control messages."""
+    try:
+        loop = asyncio.get_event_loop()
+        for server in getattr(loop, '_servers', []):
+            for sock in server.sockets:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                log_debug(f"[Net] TCP_NODELAY set on {sock.getsockname()}")
+    except Exception as e:
+        log_debug(f"[Net] TCP_NODELAY set via loop._servers failed: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler - models already loaded in main"""
     global _event_loop
     _event_loop = asyncio.get_event_loop()
+
+    # N-P0-1: Schedule TCP_NODELAY after uvicorn binds sockets (deferred to next tick)
+    _event_loop.call_soon(_set_tcp_nodelay_on_server)
 
     # Start UDP sideband for low-latency input (gyro, trackpad move, scroll)
     udp_transport = None
@@ -1230,7 +1294,7 @@ _LAN_NETS = [
     _ipaddr.ip_network("fe80::/10"),   # IPv6 link-local
     _ipaddr.ip_network("fc00::/7"),    # IPv6 ULA (private)
 ]
-_MAX_CONCURRENT_WS = 3
+_MAX_CONCURRENT_WS = 6  # N-P1-1: 3 WS types (audio/trackpad/screen) + headroom for reconnect overlap
 
 @app.middleware("http")
 async def lan_only_middleware(request: Request, call_next):
@@ -1339,7 +1403,14 @@ def _read_h264_frames(pipe, frame_queue: queue.Queue, stop_event: threading.Even
                 try:
                     frame_queue.put_nowait((is_key, timestamp_ms, bytes(pending_nals)))
                 except queue.Full:
-                    pass  # Drop frame on backpressure
+                    # N-P2-6: Never drop keyframes — evict oldest frame to make room
+                    if is_key:
+                        try:
+                            frame_queue.get_nowait()  # Evict oldest
+                            frame_queue.put_nowait((is_key, timestamp_ms, bytes(pending_nals)))
+                        except (queue.Empty, queue.Full):
+                            pass  # Should not happen, but guard anyway
+                    # P-frames can be dropped safely under backpressure
 
                 # Reset accumulator for next access unit
                 pending_nals = bytearray()
@@ -1741,7 +1812,10 @@ async def ws_screen_mirror(ws: WebSocket):
         reader_thread.start()
 
         # Sender loop — read frames from queue, send over WebSocket
+        # N-P1-4: Track send backpressure; drop P-frames if send is slow
+        # N-P2-6: Track keyframe state — drop P-frames after lost keyframe
         loop = asyncio.get_event_loop()
+        _awaiting_keyframe = False  # Set True if a keyframe was dropped
         while True:
             try:
                 frame = await loop.run_in_executor(None, lambda: frame_queue.get(timeout=1.0))
@@ -1757,10 +1831,32 @@ async def ws_screen_mirror(ws: WebSocket):
 
             is_key, timestamp_ms, h264_data = frame
 
+            # N-P2-6: If we lost a keyframe, drop all P-frames until next keyframe
+            if _awaiting_keyframe:
+                if is_key:
+                    _awaiting_keyframe = False
+                    log_debug("[Screen] Keyframe received — resuming send")
+                else:
+                    continue  # Drop P-frame (would decode to garbage)
+
+            # N-P1-4: If queue is backing up (>50% full), drop P-frames to reduce WS pressure.
+            # Never drop keyframes — they are essential for decoder sync.
+            if not is_key and frame_queue.qsize() > frame_queue.maxsize // 2:
+                continue  # Drop P-frame under backpressure
+
             # Wire format: [flags:1][timestamp:4LE][h264_data:N]
             flags = _SCREEN_FLAG_KEY if is_key else 0
-            header = struct.pack('<BI', flags, timestamp_ms)
-            await ws.send_bytes(header + h264_data)
+            # N-P2-2: Use bytearray + extend to avoid bytes concatenation allocations
+            wire = bytearray(5 + len(h264_data))
+            struct.pack_into('<BI', wire, 0, flags, timestamp_ms)
+            wire[5:] = h264_data
+            try:
+                await ws.send_bytes(bytes(wire))
+            except Exception as e:
+                if is_key:
+                    _awaiting_keyframe = True
+                    log_warning(f"[Screen] Keyframe send failed — will skip until next keyframe: {e}")
+                break
 
     except WebSocketDisconnect:
         log_info("[Screen] Client disconnected")

@@ -216,12 +216,16 @@ def preprocess_audio_frame(
     filter_state: Optional[FilterState] = None
 ) -> np.ndarray:
     """
-    Main API: Preprocess a single audio frame for real-time STT.
+    Main API: Preprocess a single audio frame for real-time VAD.
 
     Processing pipeline:
-    1. Pre-emphasis (boosts high frequencies)
-    2. High-pass filter (removes low-frequency rumble)
-    3. Energy normalization (preserves VAD accuracy)
+    1. High-pass filter (removes low-frequency rumble)
+    2. Energy normalization (preserves VAD accuracy)
+
+    AU-P2-2: Pre-emphasis removed from VAD path — it caused false positive
+    speech detection on sibilants (boosted high-freq energy misinterpreted
+    by Silero VAD as speech onset). The high-pass filter alone is sufficient
+    for removing non-speech noise before VAD.
 
     Args:
         audio: Input audio frame (float32, shape: [samples])
@@ -252,7 +256,8 @@ def preprocess_audio_frame(
     # Per-frame mean subtraction on 32ms frames distorts speech (non-integer cycles → content-dependent HPF).
     processed = audio.copy()
 
-    processed = apply_preemphasis(processed, coef=config.preemphasis_coef)
+    # AU-P2-2: Pre-emphasis removed — causes VAD false positives on sibilants
+    # and biases Whisper (AU-P1-1). High-pass filter alone handles noise.
 
     processed = apply_highpass_filter(
         processed,
@@ -278,10 +283,14 @@ def preprocess_audio_buffer(
     config: Optional[AudioPreprocessingConfig] = None
 ) -> np.ndarray:
     """
-    Preprocess accumulated audio buffer before transcription.
+    Preprocess accumulated audio buffer before transcription (Whisper).
 
-    Same processing as preprocess_audio_frame but for larger buffers.
-    Used after VAD detection, before feeding to Whisper.
+    AU-P1-1: Only applies high-pass filter (rumble removal), NOT pre-emphasis.
+    Whisper was not trained with pre-emphasis — applying it biases inference
+    by boosting high frequencies beyond what the model expects.
+
+    Pre-emphasis is intentionally kept for per-frame VAD processing (preprocess_audio_frame)
+    where it helps distinguish speech from noise.
 
     Args:
         audio: Input audio buffer (float32, shape: [samples])
@@ -296,14 +305,30 @@ def preprocess_audio_buffer(
         >>> speech_buffer = np.random.randn(48000).astype('float32')  # 3 seconds
         >>> processed = preprocess_audio_buffer(speech_buffer)
     """
-    # For buffer processing, we don't preserve energy since Whisper
-    # has its own normalization and is trained on varied loudness
-    return preprocess_audio_frame(
+    if config is None:
+        config = get_config()
+
+    if not config.enabled:
+        return audio
+
+    if not isinstance(audio, np.ndarray):
+        audio = np.array(audio, dtype=np.float32)
+    if audio.dtype != np.float32:
+        audio = audio.astype(np.float32)
+    if len(audio) == 0:
+        return audio
+
+    # AU-P1-1: Only high-pass filter for Whisper path — no pre-emphasis, no energy normalization.
+    # Whisper has its own internal normalization and was trained on raw audio.
+    processed = apply_highpass_filter(
         audio,
         sample_rate=sample_rate,
-        config=config,
-        preserve_original_energy=False
+        cutoff=config.highpass_cutoff,
+        order=config.highpass_order,
+        filter_state=None  # Batch mode (zero-phase) for full buffer
     )
+
+    return processed
 
 
 def get_filter_latency(num_samples: int = 512, sample_rate: int = 16000) -> Tuple[float, str]:

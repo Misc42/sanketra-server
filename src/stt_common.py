@@ -299,8 +299,8 @@ def get_linux_input_tool():
 STREAMING_SAMPLE_RATE = 16000
 STREAMING_CHUNK_SAMPLES = 512  # 32ms @ 16kHz - Silero VAD requirement
 STREAMING_MIN_SPEECH_MS = 250
-STREAMING_MIN_SILENCE_MS = 500
-STREAMING_SILENCE_THRESHOLD = 16  # chunks for 500ms silence
+STREAMING_MIN_SILENCE_MS = 700  # AU-P1-4: 700ms for Hindi mid-sentence pauses (was 500ms, too aggressive)
+STREAMING_SILENCE_THRESHOLD = 22  # chunks for 700ms silence (700ms / 32ms per chunk ≈ 22)
 
 # ============================================================================
 #                              GPU UTILITIES

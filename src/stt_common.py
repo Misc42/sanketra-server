@@ -309,14 +309,53 @@ STREAMING_SILENCE_THRESHOLD = 22  # chunks for 700ms silence (700ms / 32ms per c
 _gpu_handle = None
 _gpu_available = False
 
+def _try_cuda_recovery():
+    """Attempt to recover CUDA by reloading nvidia_uvm kernel module (Linux only).
+    Requires passwordless sudo rule installed by setup.py."""
+    import platform, subprocess
+    if platform.system() != "Linux":
+        return False
+    try:
+        subprocess.run(['sudo', '-n', 'modprobe', '-r', 'nvidia_uvm'],
+                       capture_output=True, timeout=10)
+        subprocess.run(['sudo', '-n', 'modprobe', 'nvidia_uvm'],
+                       capture_output=True, timeout=10)
+        return True
+    except Exception:
+        return False
+
 def init_gpu():
-    """Initialize GPU monitoring. Returns (handle, success)"""
+    """Initialize GPU monitoring. Returns (handle, success).
+    If CUDA is in error state (e.g. after SIGKILL), attempts nvidia_uvm
+    module reload recovery up to 2 times."""
     global _gpu_handle, _gpu_available
     try:
         import pynvml
         pynvml.nvmlInit()
         _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         _gpu_available = True
+
+        # pynvml works but torch CUDA might be broken — check and recover
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                import shutil
+                if shutil.which('nvidia-smi'):
+                    # GPU exists (pynvml works) but torch can't init CUDA — try recovery
+                    for attempt in range(2):
+                        print(f"CUDA unavailable, attempting recovery ({attempt + 1}/2)...")
+                        if _try_cuda_recovery():
+                            # Force torch to re-check CUDA after module reload
+                            import importlib
+                            importlib.reload(torch.cuda)
+                            if torch.cuda.is_available():
+                                print("CUDA recovered successfully")
+                                break
+                    else:
+                        print("CUDA recovery failed — model will load on CPU")
+        except Exception:
+            pass
+
         return _gpu_handle, True
     except Exception as e:
         print(f"GPU not available: {e}")
@@ -598,18 +637,18 @@ def get_system_info():
     """Get comprehensive system info for display"""
     import platform as plat
 
-    # GPU info
+    # GPU info — reuse global handle from init_gpu() to avoid extra nvmlInit() calls
     gpu_name, vram_total, vram_used = "No GPU", 0, 0
     try:
-        import pynvml
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        gpu_name = pynvml.nvmlDeviceGetName(handle)
-        if isinstance(gpu_name, bytes):
-            gpu_name = gpu_name.decode('utf-8')
-        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        vram_total = mem.total / (1024**3)
-        vram_used = mem.used / (1024**3)
+        init_gpu()  # idempotent — sets _gpu_handle if not already set
+        if _gpu_available and _gpu_handle is not None:
+            import pynvml
+            gpu_name = pynvml.nvmlDeviceGetName(_gpu_handle)
+            if isinstance(gpu_name, bytes):
+                gpu_name = gpu_name.decode('utf-8')
+            mem = pynvml.nvmlDeviceGetMemoryInfo(_gpu_handle)
+            vram_total = mem.total / (1024**3)
+            vram_used = mem.used / (1024**3)
     except Exception:
         pass
 
@@ -955,13 +994,42 @@ def _lat_color(latency_ms):
     return _RED
 
 def _get_recommended_model(vram_free, models):
-    """Get recommended model index using balanced logic."""
+    """Get recommended model index based on GPU VRAM or CPU capabilities."""
     priority = ["large-v3-turbo", "medium", "small", "base", "tiny"]
-    for m in priority:
+
+    # GPU path: pick best model that fits in VRAM
+    if vram_free > 0:
+        for m in priority:
+            if m not in models:
+                continue
+            if MODEL_VRAM[m]["float16"] + INFERENCE_BUFFER_GB <= vram_free:
+                return models.index(m)
+
+    # CPU path: pick best model based on RAM + core count
+    # Latency ref (int8, per 5s audio, mid-range laptop CPU):
+    #   turbo ~3s, medium ~4.5s, small ~1.8s, base ~0.7s, tiny ~0.4s
+    # All are ≤1x real-time on 6+ core CPUs, so recommend by capability.
+    try:
+        import psutil
+        ram_free = psutil.virtual_memory().available / (1024**3)
+        cores = psutil.cpu_count(logical=True)
+    except Exception:
+        ram_free, cores = 4, 4
+
+    #                  (model,             min_ram, min_cores)
+    cpu_tiers = [
+        ("large-v3-turbo", 4, 8),
+        ("medium",         4, 6),
+        ("small",          2, 4),
+        ("base",           1, 2),
+        ("tiny",           0, 1),
+    ]
+    for m, min_ram, min_cores in cpu_tiers:
         if m not in models:
             continue
-        if MODEL_VRAM[m]["float16"] + INFERENCE_BUFFER_GB <= vram_free:
+        if ram_free >= min_ram and cores >= min_cores:
             return models.index(m)
+
     return models.index("tiny") if "tiny" in models else 0
 
 def custom_model_selection():

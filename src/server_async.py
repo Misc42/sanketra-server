@@ -195,7 +195,7 @@ def _set_pair_lock(locked: bool, device_ip: str = None):
     _pair_locked = locked
 
 from stt_common import (
-    load_whisper, load_vad, to_roman, select_model, init_gpu, get_gpu_stats,
+    load_whisper, load_vad, to_roman, select_model, init_gpu, get_gpu_stats, cleanup_gpu,
     type_text, key_press, mouse_move, mouse_click, mouse_drag, mouse_scroll,
     mouse_move_absolute, get_screen_resolution, get_screen_resolution_physical, check_input_health,
     setup_logging, log_info, log_debug, log_error, log_warning,
@@ -1079,6 +1079,9 @@ def _load_model_async(model_name, precision=None):
             if whisper_model is not None:
                 whisper_model = None
                 if has_gpu:
+                    import gc
+                    gc.collect()
+                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
 
         _model_load_progress = 0.3
@@ -1092,6 +1095,9 @@ def _load_model_async(model_name, precision=None):
                 whisper_model = None
             _loaded_model_name = None
             if has_gpu:
+                import gc
+                gc.collect()
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
             _server_state = ServerState.IDLE
             _model_load_progress = 0.0
@@ -1121,8 +1127,11 @@ def _unload_model():
             whisper_model = None
             _loaded_model_name = None
             try:
+                import gc
+                gc.collect()
                 import torch
                 if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
             except Exception as e:
                 log_warning(f"CUDA cache clear failed: {e}")
@@ -1252,28 +1261,64 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup
+    log_info("[Shutdown] Starting graceful shutdown...")
+
     if udp_transport:
         udp_transport.close()
     if unload_task:
         unload_task.cancel()
     input_monitor.stop_monitor()
 
-    # P2-29: Kill all active ffmpeg processes on shutdown
+    # P2-29: Kill all active ffmpeg processes on shutdown (before GPU cleanup —
+    # NVENC ffmpeg holds its own CUDA context that must be released first)
     with _ffmpeg_procs_lock:
         for proc in list(_active_ffmpeg_procs):
             try:
                 if proc.poll() is None:
                     proc.terminate()
                     try:
-                        proc.wait(timeout=1)
+                        proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         proc.kill()
+                        proc.wait(timeout=1)
             except Exception as e:
                 log_warning(f"[Shutdown] ffmpeg cleanup error: {e}")
         _active_ffmpeg_procs.clear()
 
+    # Wait for any in-flight Whisper inference to finish before releasing model.
+    # wait=True with a short timeout so we don't hang on stuck threads.
     if executor:
-        executor.shutdown(wait=False, cancel_futures=True)
+        executor.shutdown(wait=True, cancel_futures=True)
+        executor = None
+
+    # GPU cleanup: release CTranslate2 model + PyTorch tensors + CUDA cache + pynvml
+    global whisper_model, vad_model, vad_utils
+    try:
+        with _whisper_lock:
+            if whisper_model is not None:
+                whisper_model = None
+                log_info("[Shutdown] Whisper model released")
+        if vad_model is not None:
+            vad_model = None
+            vad_utils = None
+            log_info("[Shutdown] VAD model released")
+
+        # Force Python GC before CUDA cleanup so all model tensor refs are dropped
+        import gc
+        gc.collect()
+
+        # Flush CUDA memory and synchronize pending ops
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            log_info("[Shutdown] CUDA cache flushed")
+
+        # Release pynvml handle
+        cleanup_gpu()
+        log_info("[Shutdown] pynvml shutdown complete")
+    except Exception as e:
+        log_warning(f"[Shutdown] GPU cleanup error (non-fatal): {e}")
+
     if io_executor:
         io_executor.shutdown(wait=False, cancel_futures=True)
     if _model_load_executor:
@@ -4261,6 +4306,21 @@ if __name__ == "__main__":
 
     SERVER_PORT = port
     _udp_port = port + 1  # Sideband UDP port always one above HTTP port
+
+    # Self-heal: ensure systemd service file has adequate stop timeout for GPU cleanup
+    if platform.system() == "Linux" and args.service:
+        try:
+            svc_path = os.path.expanduser("~/.config/systemd/user/sanketra.service")
+            if os.path.isfile(svc_path):
+                svc_text = open(svc_path).read()
+                if "TimeoutStopSec=3" in svc_text:
+                    svc_text = svc_text.replace("TimeoutStopSec=3", "TimeoutStopSec=10")
+                    with open(svc_path, "w") as f:
+                        f.write(svc_text)
+                    os.system("systemctl --user daemon-reload")
+                    log_info("Self-healed systemd TimeoutStopSec 3→10")
+        except Exception:
+            pass
     url = f"https://{ip}:{port}?token={AUTH_TOKEN}"
 
     # Show URL
@@ -4274,13 +4334,39 @@ if __name__ == "__main__":
     else:
         log_info(f"URL: {url}")
 
-    # Graceful shutdown on SIGTERM (systemd/launchd/schtasks stop)
-    import signal
-    def _shutdown_handler(signum, frame):
-        raise SystemExit(0)
-    signal.signal(signal.SIGTERM, _shutdown_handler)
+    # Graceful shutdown: on Linux/macOS, let uvicorn handle SIGTERM natively
+    # (it does proper lifespan teardown). Only override SIGBREAK on Windows
+    # (schtasks /end sends CTRL_BREAK which uvicorn doesn't handle).
     if platform.system() == 'Windows':
+        import signal
+        def _shutdown_handler(signum, frame):
+            raise SystemExit(0)
         signal.signal(signal.SIGBREAK, _shutdown_handler)
+
+    # atexit safety net: release GPU resources even if lifespan teardown doesn't run
+    # (e.g. SIGTERM during startup, or interpreter shutdown before lifespan completes)
+    import atexit
+    _atexit_state = {"done": False}
+    def _atexit_gpu_cleanup():
+        if _atexit_state["done"]:
+            return
+        _atexit_state["done"] = True
+        global whisper_model, vad_model, vad_utils
+        try:
+            if whisper_model is not None:
+                whisper_model = None
+            if vad_model is not None:
+                vad_model = None
+                vad_utils = None
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            cleanup_gpu()
+        except Exception:
+            pass  # Best effort during interpreter shutdown
+    atexit.register(_atexit_gpu_cleanup)
 
     # Run server
     if bg_mode and platform.system() == "Windows":

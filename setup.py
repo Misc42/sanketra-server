@@ -647,6 +647,8 @@ WorkingDirectory={SCRIPT_DIR}
 ExecStart={venv_python} {server_script} --service
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=10
+KillSignal=SIGTERM
 Environment=DISPLAY=:0
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 

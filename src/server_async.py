@@ -48,6 +48,7 @@ import struct
 import queue
 import hashlib
 import json
+import signal
 from enum import Enum, auto
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
@@ -1204,6 +1205,29 @@ async def _auto_unload_timer():
             log_info(f"No WS connections for {int(elapsed)}s — unloading model")
             _unload_model()
 
+_WATCHDOG_GRACE_SECONDS = 15
+_watchdog_armed = False
+
+async def _watchdog_shutdown_timer():
+    """Service mode: auto-shutdown after all clients disconnect."""
+    global _watchdog_armed
+    while True:
+        await asyncio.sleep(5)
+        if not _SERVICE_MODE:
+            continue
+        with _ws_track_lock:
+            has_connections = len(_active_audio_ws) > 0
+        if has_connections:
+            _watchdog_armed = True
+            continue
+        if not _watchdog_armed:
+            continue
+        elapsed = time.time() - _last_ws_activity
+        if elapsed >= _WATCHDOG_GRACE_SECONDS:
+            log_info(f"[Watchdog] No clients for {int(elapsed)}s — shutting down server")
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
 def _set_tcp_nodelay_on_server():
     """N-P0-1: Set TCP_NODELAY on uvicorn's listening sockets to disable Nagle's algorithm.
     Reduces small-packet latency by 40-200ms for WS control messages."""
@@ -1254,9 +1278,12 @@ async def lifespan(app: FastAPI):
 
     # Start auto-unload timer for service mode
     unload_task = None
+    watchdog_task = None
     if _SERVICE_MODE:
         unload_task = asyncio.create_task(_auto_unload_timer())
         unload_task.add_done_callback(_task_done)
+        watchdog_task = asyncio.create_task(_watchdog_shutdown_timer())
+        watchdog_task.add_done_callback(_task_done)
 
     yield
 
@@ -1267,6 +1294,8 @@ async def lifespan(app: FastAPI):
         udp_transport.close()
     if unload_task:
         unload_task.cancel()
+    if watchdog_task:
+        watchdog_task.cancel()
     input_monitor.stop_monitor()
 
     # P2-29: Kill all active ffmpeg processes on shutdown (before GPU cleanup —
@@ -1954,10 +1983,25 @@ async def screen_info(request: Request, token: str = Query(None)):
     w, h = get_screen_resolution()
     return {"w": w, "h": h}
 
+def _get_preferred_ip():
+    """Default-route IP — typically the Ethernet interface."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
 @app.get("/api/discover")
 async def api_discover():
     """LAN discovery endpoint — no auth required, returns service identity"""
-    return {"service": "sanketra", "name": platform.node(), "port": SERVER_PORT, "udp_port": _udp_port, "os": platform.system(), "server_id": _get_server_id()}
+    resp = {"service": "sanketra", "name": platform.node(), "port": SERVER_PORT, "udp_port": _udp_port, "os": platform.system(), "server_id": _get_server_id()}
+    pip = _get_preferred_ip()
+    if pip:
+        resp["preferred_ip"] = pip
+    return resp
 
 @app.post("/api/pair")
 async def api_pair(request: Request):

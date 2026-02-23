@@ -1071,10 +1071,13 @@ def _load_model_async(model_name, precision=None, force_device=None):
             device = "cuda" if has_gpu else "cpu"
 
         if precision is None:
-            from stt_common import auto_select_precision, get_vram_free, gpu_supports_float16
-            vram = get_vram_free()
-            fp16 = gpu_supports_float16() if has_gpu else False
-            precision = auto_select_precision(model_name, vram, fp16) if has_gpu else "int8"
+            if device == "cuda":
+                from stt_common import auto_select_precision, get_vram_free, gpu_supports_float16
+                vram = get_vram_free()
+                fp16 = gpu_supports_float16()
+                precision = auto_select_precision(model_name, vram, fp16)
+            else:
+                precision = "int8"
 
         _model_load_progress = 0.1
         if _model_load_cancel:

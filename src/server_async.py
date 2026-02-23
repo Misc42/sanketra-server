@@ -1065,6 +1065,23 @@ def _load_model_async(model_name, precision=None, force_device=None):
     try:
         import torch
         has_gpu = torch.cuda.is_available()
+
+        # If CUDA unavailable but GPU physically exists, try recovery at load time
+        # (catches cases where init_gpu() recovery failed at startup)
+        if not has_gpu:
+            import shutil
+            if shutil.which('nvidia-smi'):
+                from stt_common import _try_cuda_recovery
+                log_info("CUDA unavailable at model load — attempting recovery")
+                for attempt in range(2):
+                    if _try_cuda_recovery():
+                        import importlib
+                        importlib.reload(torch.cuda)
+                        if torch.cuda.is_available():
+                            has_gpu = True
+                            log_info(f"CUDA recovered at model load (attempt {attempt + 1})")
+                            break
+
         if force_device in ("cuda", "cpu"):
             device = force_device
         else:
@@ -1096,7 +1113,16 @@ def _load_model_async(model_name, precision=None, force_device=None):
 
         _model_load_progress = 0.3
 
-        new_model = load_whisper(model_name, device=device, compute_type=precision)
+        try:
+            new_model = load_whisper(model_name, device=device, compute_type=precision)
+        except Exception as cuda_err:
+            if device == "cuda":
+                log_info(f"CUDA load failed ({cuda_err}), falling back to CPU with int8")
+                device = "cpu"
+                precision = "int8"
+                new_model = load_whisper(model_name, device=device, compute_type=precision)
+            else:
+                raise
 
         # Check cancel again after the expensive load_whisper() call
         if _model_load_cancel:
@@ -1215,7 +1241,7 @@ async def _auto_unload_timer():
             log_info(f"No WS connections for {int(elapsed)}s — unloading model")
             _unload_model()
 
-_WATCHDOG_GRACE_SECONDS = 15
+_WATCHDOG_GRACE_SECONDS = 10
 _watchdog_armed = False
 
 async def _watchdog_shutdown_timer():

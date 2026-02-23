@@ -88,6 +88,7 @@ _server_state = ServerState.ACTIVE  # Default: ACTIVE (legacy mode loads model a
 _model_load_progress = 0.0  # 0.0-1.0
 _model_load_cancel = False
 _loaded_model_name = None
+_loaded_device = "cpu"  # "cuda" or "cpu" — actual device model is running on
 _last_ws_activity = time.time()  # For auto-unload timer
 _MODEL_UNLOAD_TIMEOUT = 900  # 15 minutes no WS connections
 
@@ -1037,8 +1038,10 @@ def init_models(preference="balanced", direct_model=None, verbose=True):
     else:
         model_name, compute_type, device = select_model(preference)
 
+    global _loaded_device
     whisper_model = load_whisper(model_name, device=device, compute_type=compute_type)
     _loaded_model_name = model_name
+    _loaded_device = device
     _server_state = ServerState.ACTIVE
 
     vram_after, _, _ = get_gpu_stats()
@@ -1048,9 +1051,9 @@ def init_models(preference="balanced", direct_model=None, verbose=True):
     log_info("Models loaded - ready to accept connections")
 
 
-def _load_model_async(model_name, precision=None):
+def _load_model_async(model_name, precision=None, force_device=None):
     """Load a Whisper model (called from API). Runs in executor."""
-    global whisper_model, _server_state, _loaded_model_name, _model_load_progress, _model_load_cancel
+    global whisper_model, _server_state, _loaded_model_name, _loaded_device, _model_load_progress, _model_load_cancel
 
     if _server_state == ServerState.LOADING:
         return {"error": "Already loading a model"}
@@ -1062,7 +1065,10 @@ def _load_model_async(model_name, precision=None):
     try:
         import torch
         has_gpu = torch.cuda.is_available()
-        device = "cuda" if has_gpu else "cpu"
+        if force_device in ("cuda", "cpu"):
+            device = force_device
+        else:
+            device = "cuda" if has_gpu else "cpu"
 
         if precision is None:
             from stt_common import auto_select_precision, get_vram_free, gpu_supports_float16
@@ -1108,6 +1114,7 @@ def _load_model_async(model_name, precision=None):
         with _whisper_lock:
             whisper_model = new_model
         _loaded_model_name = model_name
+        _loaded_device = device
         _model_load_progress = 1.0
         _server_state = ServerState.ACTIVE
         log_info(f"Model loaded: {model_name} ({precision} on {device})")
@@ -1316,6 +1323,7 @@ async def lifespan(app: FastAPI):
 
     # Wait for any in-flight Whisper inference to finish before releasing model.
     # wait=True with a short timeout so we don't hang on stuck threads.
+    global executor
     if executor:
         executor.shutdown(wait=True, cancel_futures=True)
         executor = None
@@ -2222,13 +2230,14 @@ async def api_model_load(request: Request, token: str = Query(None)):
 
     model_name = body.get("model", "")
     precision = body.get("precision")  # Optional, auto-select if None
+    force_device = body.get("device")  # Optional: "cuda" or "cpu" to override auto-detect
     valid_models = ["tiny", "base", "small", "medium", "large-v3-turbo", "distil-large-v3", "large-v3"]
     if model_name not in valid_models:
         return JSONResponse({"error": f"Invalid model. Choose from: {valid_models}"}, status_code=400)
 
     # Load model in dedicated executor (keeps main whisper executor free for transcription)
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(_model_load_executor, _load_model_async, model_name, precision)
+    result = await loop.run_in_executor(_model_load_executor, _load_model_async, model_name, precision, force_device)
     return result
 
 @app.get("/api/model/status")
@@ -2241,6 +2250,7 @@ async def api_model_status(request: Request, token: str = Query(None)):
         "state": _server_state.name,
         "model": _loaded_model_name,
         "progress": round(_model_load_progress, 2),
+        "device": _loaded_device,
     }
 
 @app.post("/api/model/cancel")

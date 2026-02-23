@@ -530,31 +530,38 @@ def uninstall():
                     pass
         return total
 
-    # 1. Stop and remove service
+    # 1. Stop and remove service (current + pre-rebrand legacy)
     plat = get_platform()
     if plat == 'linux':
-        run("systemctl --user stop sanketra 2>/dev/null")
-        run("systemctl --user disable sanketra 2>/dev/null")
-        service_path = os.path.expanduser("~/.config/systemd/user/sanketra.service")
-        if os.path.exists(service_path):
-            os.remove(service_path)
-            run("systemctl --user daemon-reload")
-            removed.append("systemd service")
+        for svc in ["sanketra", "mic_on_term"]:
+            run(f"systemctl --user stop {svc} 2>/dev/null")
+            run(f"systemctl --user disable {svc} 2>/dev/null")
+            svc_path = os.path.expanduser(f"~/.config/systemd/user/{svc}.service")
+            if os.path.exists(svc_path):
+                os.remove(svc_path)
+                removed.append(f"systemd {svc}")
+        run("systemctl --user daemon-reload")
+        # Remove sudoers rules installed by setup
+        for sudoers in ["/etc/sudoers.d/sanketra-gpu", "/etc/sudoers.d/ydotool"]:
+            if os.path.exists(sudoers):
+                subprocess.run(['sudo', 'rm', '-f', sudoers], capture_output=True)
+                removed.append(os.path.basename(sudoers))
     elif plat == 'windows':
-        run('schtasks /end /tn "sanketra" 2>nul')
-        run('schtasks /delete /tn "sanketra" /f 2>nul')
-        # Remove firewall rules
-        subprocess.run(['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
-                        'name=sanketra'], capture_output=True, check=False)
-        subprocess.run(['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
-                        'name=sanketra UDP'], capture_output=True, check=False)
-        removed.append("scheduled task")
+        for task in ["sanketra", "mic_on_term"]:
+            run(f'schtasks /end /tn "{task}" 2>nul')
+            run(f'schtasks /delete /tn "{task}" /f 2>nul')
+        # Remove firewall rules (current + legacy)
+        for rule_name in ["sanketra", "sanketra UDP", "mic_on_term", "mic_on_term UDP"]:
+            subprocess.run(['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                            f'name={rule_name}'], capture_output=True, check=False)
+        removed.append("scheduled task + firewall")
     elif plat == 'macos':
-        plist_path = os.path.expanduser("~/Library/LaunchAgents/com.miconterm.server.plist")
-        run(f'launchctl unload "{plist_path}" 2>/dev/null')
-        if os.path.exists(plist_path):
-            os.remove(plist_path)
-            removed.append("launchd service")
+        for plist_name in ["com.miconterm.server", "com.miconterm.mic_on_term"]:
+            plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{plist_name}.plist")
+            run(f'launchctl unload "{plist_path}" 2>/dev/null')
+            if os.path.exists(plist_path):
+                os.remove(plist_path)
+                removed.append(f"launchd {plist_name}")
 
     # 2. Remove venv (biggest item — torch + deps)
     if os.path.exists(VENV_DIR):
@@ -562,12 +569,13 @@ def uninstall():
         shutil.rmtree(VENV_DIR)
         removed.append("venv")
 
-    # 3. Remove config directory (~/.config/sanketra/)
-    config_dir = os.path.expanduser("~/.config/sanketra")
-    if os.path.exists(config_dir):
-        freed += dir_size(config_dir)
-        shutil.rmtree(config_dir)
-        removed.append("config")
+    # 3. Remove config directories (~/.config/sanketra/ + legacy ~/.config/mic_on_term/)
+    for cfg_name in ["sanketra", "mic_on_term"]:
+        config_dir = os.path.expanduser(f"~/.config/{cfg_name}")
+        if os.path.exists(config_dir):
+            freed += dir_size(config_dir)
+            shutil.rmtree(config_dir)
+            removed.append(f"config ({cfg_name})")
 
     # 4. Remove Whisper model cache (~/.cache/huggingface/hub/models--Systran--faster-whisper-*)
     hf_cache = os.path.expanduser("~/.cache/huggingface/hub")

@@ -428,6 +428,52 @@ def step_runscript():
     return False, "not found"
 
 # =============================================================================
+#                         APP PASSWORD GENERATION
+# =============================================================================
+
+def _generate_app_password():
+    """Generate app password and write hash to config.json if none exists.
+    Returns plaintext password (for display) or None if already set."""
+    import secrets as _secrets
+    import json
+
+    config_dir = os.path.join(os.path.expanduser("~"), ".config", "sanketra")
+    config_file = os.path.join(config_dir, "config.json")
+
+    # Load existing config
+    config = {}
+    if os.path.exists(config_file):
+        try:
+            with open(config_file) as f:
+                config = json.load(f)
+        except Exception:
+            pass
+
+    # Skip if password already set
+    if config.get("password_hash"):
+        return None
+
+    # Generate 20-char password
+    password = _secrets.token_urlsafe(15)  # ~20 chars
+
+    # Hash with PBKDF2 (always available, no extra deps needed during setup)
+    import hashlib
+    salt = _secrets.token_hex(16)
+    pw_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
+    config["password_hash"] = f"pbkdf2:{salt}:{pw_hash}"
+
+    # Write config
+    os.makedirs(config_dir, exist_ok=True)
+    tmp_path = config_file + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(config, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, config_file)
+
+    return password
+
+# =============================================================================
 #                              MAIN
 # =============================================================================
 
@@ -490,6 +536,9 @@ def install():
             print(f"{C.R}{C.X}{C.E} {msg}")
             sys.exit(1)
 
+    # Generate app password if none exists
+    app_password = _generate_app_password()
+
     total_time = time.time() - start
     if plat == 'windows':
         run_cmd = "scripts\\windows\\run_bg.bat"
@@ -501,6 +550,15 @@ def install():
     print(f"""
   {C.D}─────────────────────{C.E}
   {C.G}{C.OK} ready{C.E} {C.D}in {format_time(total_time)}{C.E}
+""")
+
+    # Show password prominently if generated
+    if app_password:
+        print(f"""  {C.B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.E}
+  {C.B}  Your password:{C.E}  {C.G}{app_password}{C.E}
+  {C.B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.E}
+  {C.D}  Enter this on your phone to connect.{C.E}
+  {C.D}  (saved in ~/.config/sanketra/config.json){C.E}
 """)
 
     # Print usage instructions

@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sanketra — Dashboard</title>
+<meta name="description" content="Your private dictation archive. Stays on your PC.">
+<meta name="theme-color" content="#0F0E14">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&family=Tiro+Devanagari+Hindi:ital@0;1&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+
+<!-- Paper grain overlay -->
+<div class="grain" aria-hidden="true"></div>
+
+<!-- Masthead -->
+<header class="masthead">
+  <div class="mast-inner">
+    <div class="mast-brand">
+      <span class="mast-word">SANKETRA</span>
+      <span class="mast-dot">·</span>
+      <span class="mast-section">DASHBOARD</span>
+    </div>
+    <div class="mast-meta" id="mast-meta">
+      <span id="clock">—</span>
+      <span class="mast-sep">·</span>
+      <span id="ws-status"><span class="ws-dot"></span>connecting</span>
+    </div>
+  </div>
+</header>
+
+<!-- Hero -->
+<section class="hero wrap">
+  <div class="eyebrow">01 · आज का लेखा <span class="eyebrow-en">· Your Ledger</span></div>
+  <h1 class="hero-headline">
+    PC <span class="deva">का कान<span class="danda">,</span></span><br>
+    <em class="punch">tere paas hi</em> rehta hai<span class="danda">।</span>
+  </h1>
+  <p class="hero-sub">
+    Har shabd tere PC pe. Cloud pe nahi. <strong>No account, no server, no trace.</strong>
+  </p>
+</section>
+
+<!-- Privacy banner (prominent, warm amber edge) -->
+<section class="privacy-banner wrap" id="privacy-banner">
+  <div class="privacy-rule"></div>
+  <div class="privacy-body">
+    <div class="privacy-text">
+      <span class="privacy-hi">Yeh data SIRF tere PC pe hai. Cloud pe nahi.</span>
+      <span class="privacy-en">Your data stays on <em>YOUR PC</em>. No cloud, no relay, no sync.</span>
+    </div>
+    <button class="privacy-more" id="privacy-more" aria-haspopup="dialog">
+      <span>How it works</span>
+      <span class="arrow">→</span>
+    </button>
+  </div>
+</section>
+
+<!-- Tab navigation -->
+<nav class="tabs wrap" role="tablist" aria-label="Dashboard sections">
+  <button class="tab active" role="tab" data-view="today"><span class="tab-num">01</span><span class="tab-label">Today</span></button>
+  <button class="tab" role="tab" data-view="week"><span class="tab-num">02</span><span class="tab-label">This Week</span></button>
+  <button class="tab" role="tab" data-view="all"><span class="tab-num">03</span><span class="tab-label">All</span></button>
+  <button class="tab" role="tab" data-view="search"><span class="tab-num">04</span><span class="tab-label">Search</span></button>
+  <button class="tab" role="tab" data-view="vocab"><span class="tab-num">05</span><span class="tab-label">Vocab</span></button>
+  <button class="tab" role="tab" data-view="settings"><span class="tab-num">06</span><span class="tab-label">Settings</span></button>
+</nav>
+
+<!-- Main views -->
+<main class="wrap views">
+
+  <!-- TODAY -->
+  <section class="view active" id="view-today" role="tabpanel">
+    <div class="view-head">
+      <div class="view-title-block">
+        <div class="view-eyebrow">Dictation log</div>
+        <h2 class="view-title">Aaj <span class="deva">आज</span></h2>
+        <div class="view-date" id="today-date">—</div>
+      </div>
+      <div class="view-stats" id="today-stats">
+        <span class="stat"><strong>—</strong> sessions</span>
+        <span class="stat-sep">·</span>
+        <span class="stat"><strong>—</strong> words</span>
+      </div>
+    </div>
+    <div class="view-body" id="today-body">
+      <div class="skeleton-stack" aria-busy="true">
+        <div class="skel skel-q"></div>
+        <div class="skel skel-q"></div>
+        <div class="skel skel-q short"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- WEEK -->
+  <section class="view" id="view-week" role="tabpanel" hidden>
+    <div class="view-head">
+      <div class="view-title-block">
+        <div class="view-eyebrow">Last seven days</div>
+        <h2 class="view-title">Is hafte</h2>
+      </div>
+    </div>
+    <div class="view-body" id="week-body">
+      <div class="empty-placeholder">Loading...</div>
+    </div>
+  </section>
+
+  <!-- ALL -->
+  <section class="view" id="view-all" role="tabpanel" hidden>
+    <div class="view-head">
+      <div class="view-title-block">
+        <div class="view-eyebrow">Full archive</div>
+        <h2 class="view-title">Sab kuch</h2>
+      </div>
+      <div class="pagination" id="all-pagination">
+        <button class="page-btn" id="all-prev" disabled>← Prev</button>
+        <span class="page-info" id="all-pageinfo">Page — of —</span>
+        <button class="page-btn" id="all-next" disabled>Next →</button>
+      </div>
+    </div>
+    <div class="view-body" id="all-body">
+      <div class="empty-placeholder">Loading...</div>
+    </div>
+  </section>
+
+  <!-- SEARCH -->
+  <section class="view" id="view-search" role="tabpanel" hidden>
+    <div class="view-head">
+      <div class="view-title-block">
+        <div class="view-eyebrow">Full-text search</div>
+        <h2 class="view-title">Dhoondo <span class="deva">खोजो</span></h2>
+      </div>
+    </div>
+    <div class="search-bar">
+      <span class="search-icon">⌕</span>
+      <input
+        id="search-input"
+        type="search"
+        class="search-input"
+        placeholder="Kuch bhi likho... e.g. Tanay, meeting, WhatsApp"
+        autocomplete="off"
+        spellcheck="false">
+      <span class="search-meta" id="search-meta">—</span>
+    </div>
+    <div class="view-body" id="search-body">
+      <div class="empty-quote">
+        <em>Type something above to search your archive.</em>
+      </div>
+    </div>
+  </section>
+
+  <!-- VOCAB -->
+  <section class="view" id="view-vocab" role="tabpanel" hidden>
+    <div class="view-head">
+      <div class="view-title-block">
+        <div class="view-eyebrow">Custom dictionary</div>
+        <h2 class="view-title">Vocab <span class="deva">शब्दकोश</span></h2>
+        <p class="view-blurb">Names, jargon, your own words. Whisper inko sunna seekhega.</p>
+      </div>
+    </div>
+    <div class="vocab-controls">
+      <button class="btn btn-primary" id="vocab-add">+ Add word</button>
+      <span class="vocab-count" id="vocab-count">— entries</span>
+    </div>
+    <div class="vocab-table-wrap">
+      <div class="vocab-head">
+        <span class="vh vh-text">Text</span>
+        <span class="vh vh-phon">Phonetic</span>
+        <span class="vh vh-weight">Weight</span>
+        <span class="vh vh-act"></span>
+      </div>
+      <div class="view-body" id="vocab-body">
+        <div class="empty-placeholder">Loading...</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section class="view" id="view-settings" role="tabpanel" hidden>
+    <div class="view-head">
+      <div class="view-title-block">
+        <div class="view-eyebrow">Privacy &amp; data</div>
+        <h2 class="view-title">Settings</h2>
+      </div>
+    </div>
+
+    <div class="setting-block">
+      <div class="setting-block-head">
+        <h3 class="setting-title">Logging</h3>
+        <div class="setting-sub">Save my transcripts locally · <em>Tere PC pe, aur kahin nahi.</em></div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="logging-toggle">
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+        <span class="toggle-label" id="logging-label">—</span>
+      </label>
+    </div>
+
+    <div class="setting-block">
+      <div class="setting-block-head">
+        <h3 class="setting-title">Export</h3>
+        <div class="setting-sub">Apna data download karo — JSON, TXT, ya Markdown.</div>
+      </div>
+      <div class="btn-row">
+        <button class="btn" data-export="json">JSON</button>
+        <button class="btn" data-export="txt">TXT</button>
+        <button class="btn" data-export="md">Markdown</button>
+      </div>
+    </div>
+
+    <div class="setting-block">
+      <div class="setting-block-head">
+        <h3 class="setting-title">Accent profile</h3>
+        <div class="setting-sub">Whisper tumhari awaaz ke hisaab se tune hota hai.</div>
+      </div>
+      <div class="accent-status" id="accent-status">
+        <div class="accent-line">Status: <strong>—</strong></div>
+      </div>
+    </div>
+
+    <div class="setting-block">
+      <div class="setting-block-head">
+        <h3 class="setting-title">Paired devices</h3>
+        <div class="setting-sub">Har surface jo is PC se jude hain.</div>
+      </div>
+      <div class="device-list" id="device-list">
+        <div class="empty-placeholder">Loading...</div>
+      </div>
+    </div>
+
+    <div class="setting-block danger">
+      <div class="setting-block-head">
+        <h3 class="setting-title danger-title">Danger zone</h3>
+        <div class="setting-sub">Iske baad wapas nahi aa sakta. <em>No undo.</em></div>
+      </div>
+      <button class="btn btn-danger" id="clear-all">Clear all history</button>
+    </div>
+  </section>
+
+</main>
+
+<!-- Privacy modal -->
+<div class="modal" id="privacy-modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-panel" role="dialog" aria-labelledby="pmod-title">
+    <div class="modal-eyebrow">Privacy contract</div>
+    <h3 id="pmod-title" class="modal-title">Kahan rehta hai tera data?</h3>
+    <div class="modal-body">
+      <p><strong>Storage:</strong> SQLite file at <code>~/.config/sanketra/history.db</code> on this PC.</p>
+      <p><strong>Encryption:</strong> Filesystem-level only. DPDP-acceptable. No per-row encryption because the DB never leaves your disk.</p>
+      <p><strong>What's sent over the network:</strong> Only between your PC and your phone, on your Wi-Fi. Never to us. Never to anyone else.</p>
+      <p><strong>How to clear:</strong> Settings tab → "Clear all history" (double-confirm). Or delete the .db file directly.</p>
+      <p><strong>Export:</strong> Settings tab → Export as JSON/TXT/Markdown. Portable. Yours.</p>
+      <p class="modal-quote"><em>"If a feature makes PC voice input better, we build it. If it sends your data somewhere, we don't."</em></p>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" data-close>Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Double-confirm modal (reused) -->
+<div class="modal" id="confirm-modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-panel" role="dialog" aria-labelledby="cmod-title">
+    <div class="modal-eyebrow" id="cmod-eyebrow">Confirm</div>
+    <h3 id="cmod-title" class="modal-title">Sure?</h3>
+    <div class="modal-body" id="cmod-body"></div>
+    <div class="modal-actions">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn btn-danger" id="cmod-go">Yes, do it</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast-wrap" id="toast-wrap" aria-live="polite"></div>
+
+<!-- Footer -->
+<footer class="foot wrap">
+  <span>Sanketra · Dashboard</span>
+  <span class="foot-sep">·</span>
+  <span>Served from <code>localhost</code></span>
+  <span class="foot-sep">·</span>
+  <span id="version-tag">v—</span>
+</footer>
+
+<script src="/static/dashboard.js" defer></script>
+</body>
+</html>

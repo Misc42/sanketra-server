@@ -428,15 +428,14 @@ def get_model_download_size(model_name):
 
 def load_whisper(model_name="large-v3", device="auto", compute_type="auto"):
     """
-    Load Whisper model with automatic GPU/CPU fallback
-
-    Args:
-        model_name: Whisper model name (tiny, base, small, medium, large-v3, large-v3-turbo)
-        device: "auto", "cuda", or "cpu"
-        compute_type: "auto", "float16", "int8", "int8_float16"
+    Load Whisper model with automatic GPU/CPU fallback.
 
     Returns:
-        WhisperModel instance
+        (WhisperModel, actual_device, actual_compute_type) — critical: callers must
+        use the returned values, not the requested ones. Internal fallback chain
+        (float16 → int8_float16 → int8 → CPU+int8) silently changes both. Callers
+        that reported "loaded on cuda" while the model was actually on CPU was the
+        source of a user-facing "GPU active, latency 10x" bug.
     """
     import os
     import torch
@@ -455,10 +454,9 @@ def load_whisper(model_name="large-v3", device="auto", compute_type="auto"):
             if gpu_supports_float16():
                 compute_type = "float16"
             else:
-                compute_type = "int8"  # Older GPUs use int8
+                compute_type = "int8"
                 print(f"Note: GPU doesn't support efficient float16, using int8", flush=True)
         else:
-            # Apple Silicon (arm64) supports float16 natively via CoreML/Accelerate
             import platform as _platform
             if _platform.machine() in ('arm64', 'aarch64'):
                 compute_type = "float16"
@@ -471,10 +469,9 @@ def load_whisper(model_name="large-v3", device="auto", compute_type="auto"):
     try:
         model = WhisperModel(model_name, device=device, compute_type=compute_type)
         print("Model loaded successfully", flush=True)
-        return model
-    except Exception as e:
+        return model, device, compute_type
+    except Exception:
         if device == "cuda":
-            # Try fallback compute types on CUDA before going to CPU
             fallback_types = ["int8_float16", "int8"] if compute_type == "float16" else ["int8"]
             for fallback in fallback_types:
                 if fallback == compute_type:
@@ -483,13 +480,23 @@ def load_whisper(model_name="large-v3", device="auto", compute_type="auto"):
                     print(f"Trying {fallback} on CUDA...", flush=True)
                     model = WhisperModel(model_name, device="cuda", compute_type=fallback)
                     print(f"Model loaded successfully with {fallback}", flush=True)
-                    return model
+                    return model, "cuda", fallback
                 except Exception:
                     continue
 
-            # Last resort: CPU
             print(f"CUDA failed, falling back to CPU...", flush=True)
-            return WhisperModel(model_name, device="cpu", compute_type="int8")
+            model = WhisperModel(model_name, device="cpu", compute_type="int8")
+            return model, "cpu", "int8"
+        # CPU path: Apple Silicon float16 needs Accelerate/OpenBLAS with fp16 kernels.
+        # Older builds / Rosetta / minimal wheels fall back here — retry int8 before giving up.
+        if compute_type != "int8":
+            try:
+                print(f"CPU {compute_type} failed, trying int8...", flush=True)
+                model = WhisperModel(model_name, device="cpu", compute_type="int8")
+                print("Model loaded successfully with int8", flush=True)
+                return model, "cpu", "int8"
+            except Exception:
+                pass
         raise
 
 # =============================================================================
@@ -497,21 +504,18 @@ def load_whisper(model_name="large-v3", device="auto", compute_type="auto"):
 # =============================================================================
 
 class EnergyVAD:
-    """Simple energy-based VAD using numpy only - fallback when Silero fails"""
+    """Simple energy-based VAD using numpy only - fallback when Silero fails."""
 
     def __init__(self, threshold=0.02, min_speech_ms=250, min_silence_ms=500, sample_rate=16000):
         self.threshold = threshold
-        self.min_speech_frames = int(min_speech_ms * sample_rate / 1000 / 512)  # 512 samples per frame
+        self.min_speech_frames = int(min_speech_ms * sample_rate / 1000 / 512)
         self.min_silence_frames = int(min_silence_ms * sample_rate / 1000 / 512)
         self.speech_frames = 0
         self.silence_frames = 0
         self.is_speech = False
 
     def __call__(self, audio_chunk, sample_rate=16000):
-        """Process audio chunk, return speech probability (0.0 or 1.0)"""
-        # Calculate RMS energy
-        energy = np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2))
-
+        energy = float(np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2)))
         if energy > self.threshold:
             self.speech_frames += 1
             self.silence_frames = 0
@@ -522,14 +526,50 @@ class EnergyVAD:
             self.speech_frames = 0
             if self.silence_frames >= self.min_silence_frames:
                 self.is_speech = False
-
         return 1.0 if self.is_speech else 0.0
 
     def reset_states(self):
-        """Reset VAD state"""
         self.speech_frames = 0
         self.silence_frames = 0
         self.is_speech = False
+
+
+class EnergyVADIterator:
+    """Silero-VADIterator-compatible wrapper around EnergyVAD.
+
+    Existed as raw EnergyVAD() returning 0.0/1.0 floats — server_async's
+    `_vad_sync` expects the Silero dict-return shape ({'start': ts} / {'end': ts}).
+    That mismatch caused the WS handler to bail with 4500 ("VAD unavailable")
+    whenever Silero's torch.hub.load() failed — turning the "graceful fallback"
+    into a hard outage for users on bad networks.
+    """
+
+    def __init__(self, model, sampling_rate=16000):
+        # model is an EnergyVAD instance; keep it for state
+        self.vad = model if isinstance(model, EnergyVAD) else EnergyVAD(sample_rate=sampling_rate)
+        self.was_speaking = False
+
+    def __call__(self, audio_tensor, return_seconds=False):
+        """Mimic Silero VADIterator: return {'start': ts} on rising edge,
+        {'end': ts} on falling edge, {} otherwise."""
+        # Accept torch tensor or ndarray; only need numpy for RMS
+        try:
+            arr = audio_tensor.numpy() if hasattr(audio_tensor, "numpy") else np.asarray(audio_tensor)
+        except Exception:
+            arr = np.asarray(audio_tensor)
+        self.vad(arr)
+        now_speaking = bool(self.vad.is_speech)
+        result = {}
+        if now_speaking and not self.was_speaking:
+            result["start"] = 0
+        elif not now_speaking and self.was_speaking:
+            result["end"] = 0
+        self.was_speaking = now_speaking
+        return result
+
+    def reset_states(self):
+        self.vad.reset_states()
+        self.was_speaking = False
 
 
 # Flag to track VAD type
@@ -540,16 +580,19 @@ def load_vad(force_energy=False):
     """
     Load VAD model with fallback to energy-based VAD.
 
-    Returns:
-        (model, utils) for Silero VAD, or
-        (EnergyVAD(), None) for energy-based fallback
+    Returns a (model, utils) tuple where utils is always a 5-tuple with the
+    same shape as Silero's utils (get_speech_timestamps, save_audio, read_audio,
+    VADIterator, collect_chunks). For EnergyVAD fallback, most entries are None
+    but VADIterator is EnergyVADIterator — enough for server_async.py's
+    streaming path (which only consumes utils[3]).
     """
     global _VAD_TYPE
 
     if force_energy:
         print("Using energy-based VAD (forced)...", flush=True)
         _VAD_TYPE = "energy"
-        return EnergyVAD(), None
+        evad = EnergyVAD()
+        return evad, (None, None, None, EnergyVADIterator, None)
 
     try:
         import torch
@@ -566,7 +609,8 @@ def load_vad(force_energy=False):
         print(f"Silero VAD failed: {e}", flush=True)
         print("Falling back to energy-based VAD...", flush=True)
         _VAD_TYPE = "energy"
-        return EnergyVAD(), None
+        evad = EnergyVAD()
+        return evad, (None, None, None, EnergyVADIterator, None)
 
 
 def get_vad_type():
@@ -732,6 +776,11 @@ def get_available_models():
     vram_free = sys_info["vram_free"]
     supports_fp16 = gpu_supports_float16() if has_gpu else False
 
+    # Free-tier model scope, in sync with FREE_TIER_MODELS in server_async.py.
+    # Kept as a local constant here so the catalog annotation doesn't require
+    # importing server_async (which owns license state) and cause a cycle.
+    free_tier_names = {"tiny", "base", "small"}
+
     models = []
     for name in ["tiny", "base", "small", "medium", "large-v3-turbo", "distil-large-v3"]:
         vram = MODEL_VRAM[name]
@@ -749,6 +798,9 @@ def get_available_models():
             "downloaded": is_model_downloaded(name),
             "fits_gpu": fits_gpu,
             "recommended_precision": precision,
+            # Client UI hint: show a lock icon next to Pro-only models.
+            # Enforcement remains server-side (see /api/model/load gate).
+            "requires_pro": name not in free_tier_names,
         })
 
     # Recommended model
@@ -1422,6 +1474,8 @@ def get_input_tool_info():
     else:
         return f"{PLATFORM} (pyautogui)"
 
+_type_text_lock = _threading.Lock()
+
 def type_text(text):
     """Type text at cursor position - cross-platform"""
     if not text:
@@ -1431,49 +1485,60 @@ def type_text(text):
     if is_app_input_paused():
         log_debug(f"[InputGuard] type_text suppressed: {text[:50]}")
         return
+    _mark_app_output()
 
-    if PLATFORM == 'linux':
-        tool, available = get_linux_input_tool()
-        if not available:
-            log_warning(f"Cannot type: {get_input_tool_info()}")
-            return
-
-        if tool == 'xdotool':
-            # Try Xlib direct first (no subprocess overhead), fallback to xdotool
-            if not _xlib_type_text(text):
-                subprocess.run(['xdotool', 'type', '--', text], check=False)
-        elif tool in ('ydotool', 'ydotool-sudo'):
-            _run_ydotool(['type', text])
-    elif PLATFORM in ('windows', 'macos'):
-        kb = _get_pynput_keyboard()
-        if kb:
-            try:
-                _mark_app_output()
-                kb.type(text)
+    with _type_text_lock:
+        if PLATFORM == 'linux':
+            tool, available = get_linux_input_tool()
+            if not available:
+                log_warning(f"Cannot type: {get_input_tool_info()}")
                 return
-            except Exception:
-                pass
-        # Fallback: pyautogui is ASCII-only (typewrite drops non-ASCII chars).
-        # For non-ASCII text on macOS, use clipboard paste (pyperclip + Cmd+V) as workaround.
-        # On Windows, pyautogui.write() also only handles ASCII; clipboard paste uses Ctrl+V.
-        if not text.isascii():
+
+            if tool == 'xdotool':
+                if not _xlib_type_text(text):
+                    subprocess.run(['xdotool', 'type', '--', text], check=False)
+            elif tool in ('ydotool', 'ydotool-sudo'):
+                # A6-P2-2: ydotool type emits evdev keycodes — ASCII only.
+                # For non-ASCII (Hindi, CJK, etc.), try wtype (Wayland-native Unicode)
+                # or fall back to wl-copy + Ctrl+V clipboard paste.
+                if not text.isascii():
+                    import shutil
+                    if shutil.which('wtype'):
+                        subprocess.run(['wtype', '--', text], check=False)
+                    elif shutil.which('wl-copy'):
+                        subprocess.run(['wl-copy', '--', text], check=False)
+                        _run_ydotool(['key', '29:1', '47:1', '47:0', '29:0'])  # Ctrl+V
+                    else:
+                        log_warning(f"[type_text] ydotool cannot type non-ASCII: install wtype or wl-clipboard")
+                        _run_ydotool(['type', text])  # Best-effort, will produce garbage
+                else:
+                    _run_ydotool(['type', text])
+        elif PLATFORM in ('windows', 'macos'):
+            kb = _get_pynput_keyboard()
+            if kb:
+                try:
+                    kb.type(text)
+                    return
+                except Exception:
+                    pass
+            if not text.isascii():
+                try:
+                    import pyperclip
+                    pyperclip.copy(text)
+                    import pyautogui
+                    modifier = 'command' if PLATFORM == 'macos' else 'ctrl'
+                    pyautogui.hotkey(modifier, 'v')
+                    log_debug("pynput failed — used clipboard paste for non-ASCII text")
+                    return
+                except ImportError:
+                    log_warning("pynput failed, pyperclip not available — non-ASCII text dropped")
+                except Exception:
+                    log_warning("pynput failed — clipboard paste fallback also failed")
             try:
-                import pyperclip
-                pyperclip.copy(text)
                 import pyautogui
-                modifier = 'command' if PLATFORM == 'macos' else 'ctrl'
-                pyautogui.hotkey(modifier, 'v')
-                log_debug("pynput failed — used clipboard paste for non-ASCII text")
-                return
+                pyautogui.typewrite(text, interval=0.01)
             except ImportError:
-                log_warning("pynput failed, pyperclip not available — non-ASCII text dropped")
-            except Exception:
-                log_warning("pynput failed — clipboard paste fallback also failed")
-        try:
-            import pyautogui
-            pyautogui.typewrite(text, interval=0.01)
-        except ImportError:
-            log_warning("Cannot type — install pynput")
+                log_warning("Cannot type — install pynput")
 
 def key_press(key):
     """Press a special key (enter, backspace, etc.)"""
@@ -1483,6 +1548,7 @@ def key_press(key):
         return
     if is_app_input_paused():
         return
+    _mark_app_output()
 
     key_lower = key.lower()
 
@@ -1519,7 +1585,22 @@ def key_press(key):
                         return
                 except Exception:
                     pass
-            subprocess.run(['xdotool', 'key', key], check=False)
+            # A16-P2-2: Map app key names to xdotool X11 keysym names
+            _xdotool_key_map = {
+                'enter': 'Return', 'return': 'Return',
+                'backspace': 'BackSpace', 'tab': 'Tab',
+                'escape': 'Escape', 'esc': 'Escape', 'space': 'space',
+                'left': 'Left', 'right': 'Right', 'up': 'Up', 'down': 'Down',
+                'delete': 'Delete', 'home': 'Home', 'end': 'End',
+                'insert': 'Insert',
+                'pageup': 'Page_Up', 'page_up': 'Page_Up',
+                'pagedown': 'Page_Down', 'page_down': 'Page_Down',
+                'f1': 'F1', 'f2': 'F2', 'f3': 'F3', 'f4': 'F4',
+                'f5': 'F5', 'f6': 'F6', 'f7': 'F7', 'f8': 'F8',
+                'f9': 'F9', 'f10': 'F10', 'f11': 'F11', 'f12': 'F12',
+            }
+            xdotool_key = _xdotool_key_map.get(key_lower, key)
+            subprocess.run(['xdotool', 'key', xdotool_key], check=False)
             return
 
         # Wayland: use uinput or ydotool
@@ -1575,29 +1656,35 @@ TRACKPAD_SENSITIVITY = 1.5
 SCROLL_SPEED = 3
 
 # Cached pynput controllers (for Windows/macOS - avoids creating new object each call)
+# A14-P2-10: Lock protects lazy init against concurrent first-call from tp_worker + other threads
 _pynput_mouse = None
 _pynput_keyboard = None
+_pynput_init_lock = _threading.Lock()
 
 def _get_pynput_mouse():
-    """Get cached pynput mouse controller"""
+    """Get cached pynput mouse controller (thread-safe lazy init)"""
     global _pynput_mouse
     if _pynput_mouse is None:
-        try:
-            from pynput.mouse import Controller
-            _pynput_mouse = Controller()
-        except Exception:
-            pass
+        with _pynput_init_lock:
+            if _pynput_mouse is None:  # Double-checked locking
+                try:
+                    from pynput.mouse import Controller
+                    _pynput_mouse = Controller()
+                except Exception:
+                    pass
     return _pynput_mouse
 
 def _get_pynput_keyboard():
-    """Get cached pynput keyboard controller"""
+    """Get cached pynput keyboard controller (thread-safe lazy init)"""
     global _pynput_keyboard
     if _pynput_keyboard is None:
-        try:
-            from pynput.keyboard import Controller
-            _pynput_keyboard = Controller()
-        except Exception:
-            pass
+        with _pynput_init_lock:
+            if _pynput_keyboard is None:  # Double-checked locking
+                try:
+                    from pynput.keyboard import Controller
+                    _pynput_keyboard = Controller()
+                except Exception:
+                    pass
     return _pynput_keyboard
 
 # Direct Xlib for X11 (fastest - no pynput overhead, explicit flush)
@@ -1773,7 +1860,10 @@ def _xlib_key_press(key):
         return False
 
 def _xlib_type_text(text):
-    """Type text using direct Xlib XTest (eliminates subprocess overhead)"""
+    """Type text using direct Xlib XTest (eliminates subprocess overhead).
+    Returns True only if at least one character was successfully typed.
+    Falls back to False for non-ASCII text (Hindi/Devanagari/CJK) where
+    ord(char) does not map to a valid X11 keysym."""
     d = _get_xlib_display()
     if d is None:
         return False
@@ -1782,6 +1872,7 @@ def _xlib_type_text(text):
         from Xlib.ext import xtest
 
         shift_keycode = d.keysym_to_keycode(XK.XK_Shift_L)
+        typed_count = 0
 
         for char in text:
             keysym = ord(char)
@@ -1798,9 +1889,11 @@ def _xlib_type_text(text):
             xtest.fake_input(d, X.KeyRelease, keycode)
             if need_shift:
                 xtest.fake_input(d, X.KeyRelease, shift_keycode)
+            typed_count += 1
 
         d.flush()
-        return True
+        # Return False if zero chars typed — triggers fallback to xdotool/clipboard
+        return typed_count > 0
     except Exception:
         return False
 
@@ -1968,10 +2061,11 @@ import time as _time
 
 def _detect_screen_size():
     """Detect screen resolution using platform-native APIs.
-    Windows: After SetProcessDPIAware(), GetSystemMetrics returns physical pixels.
-    However SetCursorPos uses the same coordinate space, so this is consistent
-    for mouse_move_absolute. For multi-monitor DPI-per-monitor awareness,
-    we attempt GetSystemMetricsForDpi first (Win10 1607+)."""
+    A16-P2-5: Windows HiDPI — SetProcessDpiAwareness(2) (per-monitor V2, Win10 1607+)
+    or fallback SetProcessDPIAware() is called before GetSystemMetrics, making it return
+    physical pixels. SetCursorPos also operates in physical pixels after DPI awareness is
+    set, so gyro mouse_move_absolute coords match. This is process-global and persistent —
+    whichever path runs first (here or _detect_monitors_windows) sets it for the lifetime."""
     if PLATFORM == 'windows':
         try:
             import ctypes
@@ -2015,6 +2109,315 @@ def _detect_screen_size():
         except Exception:
             pass
     return 1920, 1080
+
+
+# ============================================================================
+#                          MULTI-MONITOR DETECTION
+# ============================================================================
+
+_monitors_cache = None
+_monitors_cache_time = 0
+_MONITORS_CACHE_TTL = 30  # seconds
+
+def get_monitors():
+    """Detect all connected monitors with index, name, resolution, and position.
+    Returns list of dicts: [{index, name, width, height, x, y, primary}].
+    Cached with 30s TTL. Thread-safe.
+
+    Platform detection:
+      Linux X11: xrandr --query parsing
+      Linux Wayland: wlr-randr or swaymsg -t get_outputs
+      Windows: ctypes EnumDisplayMonitors + GetMonitorInfo
+      macOS: Quartz CGGetActiveDisplayList + CGDisplayBounds
+    """
+    global _monitors_cache, _monitors_cache_time
+    with _screen_cache_lock:  # reuse existing lock
+        now = _time.time()
+        if _monitors_cache is not None and now - _monitors_cache_time < _MONITORS_CACHE_TTL:
+            return _monitors_cache
+        _monitors_cache = _detect_monitors()
+        _monitors_cache_time = now
+        return _monitors_cache
+
+
+def _detect_monitors():
+    """Platform-specific monitor enumeration. Returns list of monitor dicts."""
+    monitors = []
+
+    if PLATFORM == 'windows':
+        monitors = _detect_monitors_windows()
+    elif PLATFORM == 'macos':
+        monitors = _detect_monitors_macos()
+    else:  # Linux
+        display = get_display_server()
+        if display == 'x11':
+            monitors = _detect_monitors_xrandr()
+        else:
+            monitors = _detect_monitors_wayland()
+
+    # Fallback: if detection failed, return single "primary" monitor from _detect_screen_size
+    if not monitors:
+        w, h = _detect_screen_size()
+        monitors = [{'index': 0, 'name': 'Primary', 'width': w, 'height': h,
+                      'x': 0, 'y': 0, 'primary': True}]
+
+    return monitors
+
+
+def _detect_monitors_xrandr():
+    """Parse `xrandr --query` output for connected monitors with resolution+position."""
+    monitors = []
+    try:
+        result = subprocess.run(['xrandr', '--query'], capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            return monitors
+
+        idx = 0
+        for line in result.stdout.splitlines():
+            # Match lines like: "HDMI-0 connected primary 2560x1600+0+0 ..."
+            # or: "DP-1 connected 1920x1080+2560+0 ..."
+            if ' connected' not in line:
+                continue
+            parts = line.split()
+            name = parts[0]
+            is_primary = 'primary' in line
+
+            # Find resolution+position: WxH+X+Y
+            match = re.search(r'(\d+)x(\d+)\+(\d+)\+(\d+)', line)
+            if not match:
+                continue  # Monitor connected but no mode active
+
+            w, h, x, y = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
+            monitors.append({
+                'index': idx, 'name': name, 'width': w, 'height': h,
+                'x': x, 'y': y, 'primary': is_primary,
+            })
+            idx += 1
+    except Exception as e:
+        log_debug(f"[Monitor] xrandr detection failed: {e}")
+    return monitors
+
+
+def _detect_monitors_wayland():
+    """Detect monitors on Wayland via swaymsg, gdbus (GNOME), or wlr-randr."""
+    monitors = []
+
+    # Try GNOME Mutter first (most common Wayland compositor)
+    # UNTESTED on real GNOME Wayland — gdbus interface is stable since GNOME 3.26
+    try:
+        result = subprocess.run(
+            ['gdbus', 'call', '--session',
+             '--dest', 'org.gnome.Mutter.DisplayConfig',
+             '--object-path', '/org/gnome/Mutter/DisplayConfig',
+             '--method', 'org.gnome.Mutter.DisplayConfig.GetCurrentState'],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            # Parse the GVariant tuple output for monitor info
+            # Format: (serial, [(connector, vendor, product, serial_str)], [logical_monitors], properties)
+            # logical_monitors: [(x, y, scale, transform, primary, [(connector, mode, properties)])]
+            import ast
+            text = result.stdout.strip()
+            # Extract logical monitors section — look for primary and position info
+            # Simple regex approach: find all monitor geometry patterns
+            import re as _re
+            # Match logical monitor entries: (x, y, scale, transform, primary, [...])
+            lm_pattern = _re.findall(r'\((\d+),\s*(\d+),\s*([\d.]+),\s*\d+,\s*(true|false)', text)
+            if lm_pattern:
+                for idx, (x, y, scale, primary) in enumerate(lm_pattern):
+                    scale_f = float(scale)
+                    # Get resolution from the monitor modes — search for current mode
+                    # Fallback: use xrandr-detected resolution
+                    monitors.append({
+                        'index': idx,
+                        'name': f'GNOME-{idx}',
+                        'width': 0,  # Filled below from mode info
+                        'height': 0,
+                        'x': int(x),
+                        'y': int(y),
+                        'primary': primary == 'true',
+                    })
+                # Try to get resolution from xrandr (XWayland) as fallback
+                if monitors:
+                    try:
+                        xr = subprocess.run(['xrandr', '--query'], capture_output=True, text=True, timeout=2)
+                        if xr.returncode == 0:
+                            res_matches = _re.findall(r'(\d+)x(\d+)\+(\d+)\+(\d+)', xr.stdout)
+                            for rm in res_matches:
+                                rw, rh, rx, ry = int(rm[0]), int(rm[1]), int(rm[2]), int(rm[3])
+                                for m in monitors:
+                                    if m['x'] == rx and m['y'] == ry and m['width'] == 0:
+                                        m['width'] = rw
+                                        m['height'] = rh
+                                        break
+                    except Exception:
+                        pass
+                    # Remove monitors with no resolution detected
+                    monitors = [m for m in monitors if m['width'] > 0 and m['height'] > 0]
+                    if monitors:
+                        return monitors
+    except Exception:
+        pass
+
+    # Try swaymsg (sway compositor)
+    try:
+        result = subprocess.run(['swaymsg', '-t', 'get_outputs', '-r'],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            import json as _json
+            outputs = _json.loads(result.stdout)
+            for idx, out in enumerate(outputs):
+                if not out.get('active', False):
+                    continue
+                rect = out.get('rect', {})
+                monitors.append({
+                    'index': idx,
+                    'name': out.get('name', f'output-{idx}'),
+                    'width': rect.get('width', 0),
+                    'height': rect.get('height', 0),
+                    'x': rect.get('x', 0),
+                    'y': rect.get('y', 0),
+                    'primary': out.get('focused', False),
+                })
+            if monitors:
+                return monitors
+    except Exception:
+        pass
+
+    # Fallback: wlr-randr (wlroots-based compositors)
+    try:
+        result = subprocess.run(['wlr-randr'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            current_name = None
+            current_pos = (0, 0)
+            idx = 0
+            for line in result.stdout.splitlines():
+                if not line.startswith(' ') and not line.startswith('\t'):
+                    current_name = line.split()[0] if line.strip() else None
+                    current_pos = (0, 0)
+                elif current_name:
+                    # Parse position line: "  Position: 1920,0"
+                    pos_match = re.search(r'Position:\s*(\d+),(\d+)', line)
+                    if pos_match:
+                        current_pos = (int(pos_match.group(1)), int(pos_match.group(2)))
+                    elif 'current' in line:
+                        match = re.search(r'(\d+)x(\d+)', line)
+                        if match:
+                            monitors.append({
+                                'index': idx,
+                                'name': current_name,
+                                'width': int(match.group(1)),
+                                'height': int(match.group(2)),
+                                'x': current_pos[0], 'y': current_pos[1],
+                                'primary': idx == 0,
+                            })
+                            idx += 1
+                            current_name = None
+    except Exception:
+        pass
+    return monitors
+
+
+def _detect_monitors_windows():
+    """Detect monitors on Windows via ctypes EnumDisplayMonitors + GetMonitorInfo."""
+    monitors = []
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        user32 = ctypes.windll.user32
+        try:
+            shcore = ctypes.windll.shcore
+            shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+        class MONITORINFOEX(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.wintypes.DWORD),
+                ("rcMonitor", ctypes.wintypes.RECT),
+                ("rcWork", ctypes.wintypes.RECT),
+                ("dwFlags", ctypes.wintypes.DWORD),
+                ("szDevice", ctypes.c_wchar * 32),
+            ]
+
+        idx_counter = [0]
+
+        def monitor_enum_cb(hMonitor, hdcMonitor, lprcMonitor, dwData):
+            info = MONITORINFOEX()
+            info.cbSize = ctypes.sizeof(MONITORINFOEX)
+            user32.GetMonitorInfoW(hMonitor, ctypes.byref(info))
+            rc = info.rcMonitor
+            is_primary = bool(info.dwFlags & 1)
+            monitors.append({
+                'index': idx_counter[0],
+                'name': info.szDevice.rstrip('\x00') or f'Monitor-{idx_counter[0]}',
+                'width': rc.right - rc.left,
+                'height': rc.bottom - rc.top,
+                'x': rc.left,
+                'y': rc.top,
+                'primary': is_primary,
+            })
+            idx_counter[0] += 1
+            return True
+
+        # A7-P1-1: LPARAM is pointer-sized (8 bytes on 64-bit Windows)
+        MONITORENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.wintypes.RECT), ctypes.wintypes.LPARAM
+        )
+        user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(monitor_enum_cb), 0)
+
+    except Exception as e:
+        log_debug(f"[Monitor] Windows monitor detection failed: {e}")
+    return monitors
+
+
+def _detect_monitors_macos():
+    """Detect monitors on macOS via Quartz CGGetActiveDisplayList + CGDisplayBounds."""
+    monitors = []
+    try:
+        import Quartz
+        import ctypes
+
+        max_displays = 16
+        display_count = ctypes.c_uint32()
+        display_ids = (ctypes.c_uint32 * max_displays)()
+        Quartz.CGGetActiveDisplayList(max_displays, display_ids, ctypes.byref(display_count))
+
+        main_display = Quartz.CGMainDisplayID()
+
+        for i in range(display_count.value):
+            did = display_ids[i]
+            bounds = Quartz.CGDisplayBounds(did)
+            # Use CGDisplayPixelsWide/High for physical pixels on Retina displays
+            # CGDisplayBounds returns logical points which are half the physical resolution
+            pw = Quartz.CGDisplayPixelsWide(did)
+            ph = Quartz.CGDisplayPixelsHigh(did)
+            monitors.append({
+                'index': i,
+                'name': f'Display-{i}',
+                'width': int(pw) if pw else int(bounds.size.width),
+                'height': int(ph) if ph else int(bounds.size.height),
+                'x': int(bounds.origin.x),
+                'y': int(bounds.origin.y),
+                'primary': did == main_display,
+            })
+    except Exception as e:
+        log_debug(f"[Monitor] macOS monitor detection failed: {e}")
+    return monitors
+
+
+def get_monitor_by_index(index):
+    """Get a specific monitor's info by index. Returns None if invalid."""
+    monitors = get_monitors()
+    for m in monitors:
+        if m['index'] == index:
+            return m
+    return None
+
 
 _screen_cache = None
 _screen_cache_time = 0
@@ -2062,6 +2465,14 @@ def _ensure_mouse_pos():
     global _mouse_pos
     if _mouse_pos is None:
         _mouse_pos = _get_initial_mouse_pos()
+
+def get_cursor_position():
+    """Return current cursor position as (x, y) tuple. Thread-safe read of _mouse_pos dict.
+    Returns None if mouse position hasn't been initialized yet."""
+    pos = _mouse_pos
+    if pos is None:
+        return None
+    return (pos['x'], pos['y'])
 _pending_move = {'dx': 0, 'dy': 0, 'last_send': 0}
 _MOVE_THROTTLE_MS = 33  # ~30fps - balance between smoothness and performance
 # Sub-pixel accumulator for Windows/macOS — prevents int() truncation from eating
@@ -2071,39 +2482,42 @@ _move_accum = {'x': 0.0, 'y': 0.0}
 _ydotool_sudo_setup_done = False
 
 def _setup_ydotool_sudo():
-    """Setup passwordless sudo for ydotool (runs once)"""
+    """Check if passwordless sudo for ydotool is already configured.
+
+    RUNTIME IS READ-ONLY: privileged setup (writing /etc/sudoers.d/ydotool) is
+    the installer's job — setup.py configures it once at install time. If the
+    check fails here at runtime, we do NOT prompt for a password or mutate
+    /etc/sudoers.d from inside the live server process. The caller gracefully
+    degrades to whatever fallback is available. Previous behavior blocked an
+    in-flight HTTP request on `sudo tee` — unacceptable.
+    """
     global _ydotool_sudo_setup_done
     if _ydotool_sudo_setup_done:
         return True
 
-    # Check if passwordless sudo already works
-    result = subprocess.run(['sudo', '-n', 'ydotool', '--help'],
-                           capture_output=True, timeout=5)
+    try:
+        result = subprocess.run(
+            ['sudo', '-n', 'ydotool', '--help'],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        return False
+
     if result.returncode == 0:
         _ydotool_sudo_setup_done = True
         return True
 
-    # Need to setup sudoers - will ask for password once
-    print("\n[First-time setup] Configuring ydotool permissions (enter password once)...")
-    user = os.environ.get('USER', 'root')
-    sudoers_content = f"{user} ALL=(ALL) NOPASSWD: /usr/bin/ydotool"
-    sudoers_file = "/etc/sudoers.d/ydotool"
-
-    # Create sudoers file — use subprocess with input= to avoid shell injection via USER
-    tee_result = subprocess.run(['sudo', 'tee', sudoers_file],
-                                input=(sudoers_content + '\n').encode(),
-                                capture_output=True)
-    chmod_result = subprocess.run(['sudo', 'chmod', '440', sudoers_file],
-                                  capture_output=True)
-    result = tee_result.returncode or chmod_result.returncode
-
-    if result == 0:
-        print("[OK] ydotool configured - no password needed from now on\n")
-        _ydotool_sudo_setup_done = True
-        return True
-    else:
-        print("[FAILED] Could not configure ydotool permissions\n")
-        return False
+    # Not configured — advise once (via log, no stdout prompt) and let caller fall back.
+    if not getattr(_setup_ydotool_sudo, "_warned", False):
+        _setup_ydotool_sudo._warned = True
+        try:
+            log_warning(
+                "[InputDispatch] ydotool passwordless sudo not configured. "
+                "Re-run `python3 setup.py` on the server to configure."
+            )
+        except Exception:
+            pass
+    return False
 
 import threading
 import queue
@@ -2157,22 +2571,33 @@ def mouse_move(dx, dy):
     global _mouse_pos, _pending_move, _move_accum
 
     if PLATFORM == 'linux':
-        # Linux paths use int directly (Xlib/uinput work with integer deltas)
-        dx_i = int(dx * TRACKPAD_SENSITIVITY)
-        dy_i = int(dy * TRACKPAD_SENSITIVITY)
+        _move_accum['x'] += dx * TRACKPAD_SENSITIVITY
+        _move_accum['y'] += dy * TRACKPAD_SENSITIVITY
+        dx_i = int(_move_accum['x'])
+        dy_i = int(_move_accum['y'])
+        if dx_i == 0 and dy_i == 0:
+            return
+        _move_accum['x'] -= dx_i
+        _move_accum['y'] -= dy_i
         display = get_display_server()
 
         # X11: direct Xlib with flush (fastest), fallback to pynput, then xdotool
         if display == 'x11':
             if _init_xlib() and _xlib_mouse_move(dx_i, dy_i):
+                _mouse_pos['x'] += dx_i
+                _mouse_pos['y'] += dy_i
                 return
             # Fallback to pynput
             mouse = _get_pynput_mouse()
             if mouse:
                 mouse.move(dx_i, dy_i)
+                _mouse_pos['x'] += dx_i
+                _mouse_pos['y'] += dy_i
                 return
             # Fallback to xdotool
             subprocess.run(['xdotool', 'mousemove_relative', '--', str(dx_i), str(dy_i)], check=False)
+            _mouse_pos['x'] += dx_i
+            _mouse_pos['y'] += dy_i
             return
 
         # Wayland: use uinput (needs permissions) or ydotool
@@ -2180,6 +2605,8 @@ def mouse_move(dx, dy):
             _write_uinput_event(_EV_REL, _REL_X, dx_i)
             _write_uinput_event(_EV_REL, _REL_Y, dy_i)
             _uinput_syn()
+            _mouse_pos['x'] += dx_i
+            _mouse_pos['y'] += dy_i
             return
 
         # Fallback to ydotool for Wayland
@@ -2215,6 +2642,8 @@ def mouse_move(dx, dy):
         if mouse:
             _mark_app_output()
             mouse.move(dx_i, dy_i)
+            _mouse_pos['x'] += dx_i
+            _mouse_pos['y'] += dy_i
 
 def mouse_move_absolute(x, y):
     """Move cursor to absolute screen position — for gyro pointer"""
@@ -2225,10 +2654,11 @@ def mouse_move_absolute(x, y):
     _ensure_mouse_pos()
     global _mouse_pos
 
-    # Clamp to screen bounds (fresh resolution, handles runtime changes)
+    # A16-P2-3: Use round() not int() — int() truncates toward zero,
+    # accumulating sub-pixel error in gyro mode (e.g. 1.7 -> 1, not 2)
     sw, sh = get_screen_resolution()
-    x = max(0, min(sw, int(x)))
-    y = max(0, min(sh, int(y)))
+    x = max(0, min(sw, round(float(x))))
+    y = max(0, min(sh, round(float(y))))
 
     if PLATFORM == 'linux':
         display = get_display_server()
@@ -2387,6 +2817,8 @@ def mouse_drag(action="down"):
         # Fallback to ydotool for Wayland
         tool, available = get_linux_input_tool()
         if not available:
+            # A16-P2-7: Log warning instead of silently dropping drag events
+            log_warning("Drag not supported without uinput or ydotool on Wayland")
             return
 
         if tool in ('ydotool', 'ydotool-sudo'):
@@ -2512,6 +2944,8 @@ def mouse_scroll(dy):
         return
     if is_app_input_paused():
         return
+    # Clamp to prevent fork-bomb via xdotool subprocess loop
+    dy = max(-50.0, min(50.0, float(dy)))
     if PLATFORM == 'linux':
         display = get_display_server()
 

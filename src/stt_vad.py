@@ -59,7 +59,7 @@ def init_models(preference="balanced"):
         model_name, compute_type, device = select_model(preference)
 
     vram_before, _, _ = get_gpu_stats()
-    whisper_model = load_whisper(model_name, device=device, compute_type=compute_type)
+    whisper_model, _, _ = load_whisper(model_name, device=device, compute_type=compute_type)
     vram_after, _, _ = get_gpu_stats()
 
     if gpu_available and vram_after > vram_before:

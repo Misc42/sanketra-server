@@ -1,0 +1,1893 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#0A0A0B" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#F2F2F7" media="(prefers-color-scheme: light)">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Sanketra</title>
+    <style>
+        :root {
+            /* Golden Ratio Spacing — Fibonacci sequence */
+            --space-3xs: 3px; --space-2xs: 5px; --space-xs: 8px;
+            --space-sm: 13px; --space-md: 21px; --space-lg: 34px; --space-xl: 55px;
+            /* Button sizes — phi ratio 64:40 = 1.6 */
+            --btn-primary: 64px; --btn-secondary: 44px;
+            /* Typography — golden ratio scale */
+            --fs-xs: 0.65rem; --fs-sm: 0.75rem; --fs-base: 0.875rem;
+            --fs-md: 1rem; --fs-lg: 1.618rem;
+            --fw-normal: 400; --fw-medium: 500; --fw-semibold: 600;
+            --ls-normal: 0; --ls-wide: 0.02em; --ls-caps: 0.06em;
+            /* Colors — neutral grey + red recording + green accent */
+            --surface-base: #0A0A0B; --surface-raised: #141416;
+            --surface-overlay: #1C1C1F; --surface-highest: #252528;
+            --surface-sheet: #1A1A1D;
+            --text-primary: #F5F5F7; --text-secondary: #8E8E93; --text-tertiary: #8E8E93;
+            --border-subtle: rgba(255,255,255,0.06); --border-medium: rgba(255,255,255,0.12);
+            --accent: #34C759; --accent-muted: rgba(52,199,89,0.15);
+            --recording: #FF3B30; --recording-muted: rgba(255,59,48,0.15);
+            --locked: #FF9500; --locked-muted: rgba(255,149,0,0.15);
+            --muted-bg: #FF3B30; --muted-stripe: #F5F5F7;
+            /* Shadows */
+            --shadow-sm: none;
+            --shadow-md: none;
+            --shadow-glow-recording: 0 0 20px rgba(255,59,48,0.25), 0 0 8px rgba(255,59,48,0.15);
+            --shadow-glow-locked: 0 0 20px rgba(255,149,0,0.25), 0 0 8px rgba(255,149,0,0.15);
+            /* Animation */
+            --duration-fast: 120ms; --duration-normal: 200ms; --duration-slow: 350ms;
+            --ease-out: cubic-bezier(0.25,0.46,0.45,0.94);
+            --ease-spring: cubic-bezier(0.34,1.56,0.64,1);
+            /* Layout */
+            --key-row-height: 48px;
+            --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+            --z-sticky: 50; --z-backdrop: 99; --z-sheet: 100;
+        }
+        @media (prefers-color-scheme: light) {
+            :root {
+                --surface-base: #F2F2F7; --surface-raised: #FFFFFF;
+                --surface-overlay: #E5E5EA; --surface-highest: #C7C7CC;
+                --surface-sheet: #F2F2F7;
+                --text-primary: #1C1C1E; --text-secondary: #636366; --text-tertiary: #8E8E93;
+                --border-subtle: rgba(0,0,0,0.06); --border-medium: rgba(0,0,0,0.12);
+                --accent: #34C759; --accent-muted: rgba(52,199,89,0.12);
+                --recording: #FF3B30; --recording-muted: rgba(255,59,48,0.12);
+                --locked: #CC7700; --locked-muted: rgba(204,119,0,0.12);
+                --muted-bg: #FF3B30; --muted-stripe: #1C1C1E;
+                --shadow-sm: 0 1px 3px rgba(0,0,0,0.08);
+                --shadow-md: 0 4px 12px rgba(0,0,0,0.1);
+                --shadow-glow-recording: 0 0 20px rgba(255,59,48,0.2), 0 0 8px rgba(255,59,48,0.1);
+                --shadow-glow-locked: 0 0 20px rgba(204,119,0,0.2), 0 0 8px rgba(204,119,0,0.1);
+            }
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, system-ui, sans-serif;
+            background: var(--surface-base);
+            color: var(--text-primary);
+            height: 100vh; height: 100dvh;
+            display: flex; flex-direction: column;
+            padding: var(--space-xs);
+            padding-top: env(safe-area-inset-top, 8px);
+            padding-bottom: env(safe-area-inset-bottom, 8px);
+            touch-action: none; user-select: none; overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+        /* Controls — two-row layout */
+        .controls { flex-shrink: 0; display: flex; flex-direction: column; align-items: center; gap: var(--space-sm); padding: var(--space-xs) 0; }
+        .controls__primary { display: flex; align-items: center; justify-content: center; gap: var(--space-lg); }
+        .controls__secondary { display: flex; align-items: center; justify-content: center; gap: var(--space-md); }
+        /* Button base — aspect-ratio: 1 guarantees no ovals */
+        .ctrl-btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            border: none; cursor: pointer; position: relative; overflow: hidden;
+            transition: background-color var(--duration-fast) var(--ease-out),
+                        transform var(--duration-normal) var(--ease-spring),
+                        box-shadow var(--duration-normal) var(--ease-out);
+            font-family: inherit; font-weight: var(--fw-semibold);
+            letter-spacing: var(--ls-caps); color: var(--text-primary);
+            aspect-ratio: 1; flex-shrink: 0;
+        }
+        /* --- Mic Button --- */
+        .mic-btn-wrapper { position: relative; display: flex; flex-direction: column; align-items: center; gap: var(--space-2xs); }
+        .mic-btn {
+            width: 80px; height: 80px; border-radius: 50%; background: var(--surface-overlay);
+            border: none; cursor: pointer; position: relative; display: flex; align-items: center; justify-content: center;
+            color: var(--text-primary); -webkit-tap-highlight-color: transparent; touch-action: none; z-index: 1;
+            transition: transform var(--duration-normal) var(--ease-spring),
+                        background-color var(--duration-fast) var(--ease-out),
+                        box-shadow var(--duration-normal) var(--ease-out);
+        }
+        .mic-btn__icon { display: flex; align-items: center; justify-content: center; pointer-events: none; }
+        .mic-btn__pulse { position: absolute; inset: -4px; border-radius: 50%; pointer-events: none; opacity: 0; }
+        .mic-btn__hint { font-size: var(--fs-xs); color: var(--text-tertiary); letter-spacing: var(--ls-wide); text-align: center; min-height: 1.2em; }
+        .mic-btn.holding { background: var(--recording); transform: scale(1.05); box-shadow: var(--shadow-glow-recording); }
+        .mic-btn.holding .mic-btn__pulse { opacity: 1; animation: mic-pulse-ring 1.5s var(--ease-out) infinite; }
+        .mic-btn.holding::before { content: '\2190'; position: absolute; left: -24px; top: 50%; transform: translateY(-50%); font-size: var(--fs-sm); color: var(--text-tertiary); opacity: 0; animation: slide-hint-left 1.5s ease-in-out infinite; pointer-events: none; }
+        .mic-btn.locked { background: var(--locked); box-shadow: var(--shadow-glow-locked); }
+        .mic-btn.locked .mic-btn__pulse { opacity: 1; animation: mic-pulse-ring-locked 1.5s var(--ease-out) infinite; }
+        .mic-btn.locked::after { content: ''; position: absolute; inset: -3px; border-radius: 50%; border: 2.5px solid var(--locked); animation: locked-ring-pulse 2s ease-in-out infinite; pointer-events: none; }
+        .mic-btn.waiting { background: var(--surface-highest); transform: scale(0.93); }
+        .mic-btn.processing { background: var(--surface-highest); pointer-events: none; opacity: 0.7; }
+        @keyframes mic-pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(255,59,48,0.45); } 70% { box-shadow: 0 0 0 14px rgba(255,59,48,0); } 100% { box-shadow: 0 0 0 0 rgba(255,59,48,0); } }
+        @keyframes mic-pulse-ring-locked { 0% { box-shadow: 0 0 0 0 rgba(255,149,0,0.45); } 70% { box-shadow: 0 0 0 14px rgba(255,149,0,0); } 100% { box-shadow: 0 0 0 0 rgba(255,149,0,0); } }
+        @keyframes locked-ring-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+        @keyframes slide-hint { 0%,100% { opacity: 0; transform: translateY(4px); } 50% { opacity: 0.6; transform: translateY(-2px); } }
+        @keyframes slide-hint-left { 0%,100% { opacity: 0; transform: translateY(-50%) translateX(4px); } 50% { opacity: 0.6; transform: translateY(-50%) translateX(-4px); } }
+        .ctrl-btn--secondary {
+            width: var(--btn-secondary); height: var(--btn-secondary);
+            border-radius: 50%; background: var(--surface-overlay);
+            font-size: var(--fs-xs); box-shadow: var(--shadow-sm);
+        }
+        .ctrl-btn--secondary:active { transform: scale(0.88); background: var(--surface-highest); }
+        .ctrl-btn--icon-only { background: transparent; box-shadow: none; color: var(--text-secondary); }
+        .ctrl-btn--icon-only:active { background: var(--surface-overlay); color: var(--text-primary); }
+        /* Settings gear rotation */
+        #settingsBtn .ctrl-btn__icon { transition: transform var(--duration-slow) var(--ease-spring); display: inline-block; }
+        #settingsBtn.open .ctrl-btn__icon { transform: rotate(90deg); }
+        .ctrl-btn__label { font-size: inherit; pointer-events: none; line-height: 1; }
+        .ctrl-btn__icon { font-size: 1.25rem; pointer-events: none; line-height: 1; }
+        .ctrl-btn:focus-visible, .key-btn:focus-visible, .btn-done:focus-visible, .seg-control__btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        .ctrl-btn:disabled { opacity: 0.25; cursor: not-allowed; }
+        #centerBtn:disabled { background: var(--surface-overlay); opacity: 0.25; }
+        #centerBtn:not(:disabled) { background: var(--surface-overlay); color: var(--accent); border: 1.5px solid var(--accent-muted); }
+        @keyframes center-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+        #centerBtn.sampling { animation: center-pulse 0.5s ease-in-out infinite; }
+        #centerBtn.set { color: var(--accent); }
+        /* Mic mute — CSS strikethrough, icon never changes */
+        #muteBtn { position: relative; overflow: visible; }
+        #muteBtn::after {
+            content: ''; position: absolute; top: 50%; left: 50%;
+            width: 110%; height: 2.5px; background: var(--muted-stripe);
+            border-radius: 2px; transform: translate(-50%,-50%) rotate(-45deg) scaleX(0);
+            transition: transform var(--duration-normal) var(--ease-spring),
+                        opacity var(--duration-fast) var(--ease-out);
+            opacity: 0; z-index: 1; pointer-events: none;
+        }
+        #muteBtn.muted { background: var(--muted-bg); box-shadow: 0 0 12px rgba(255,59,48,0.3); }
+        #muteBtn.muted::after { transform: translate(-50%,-50%) rotate(-45deg) scaleX(1); opacity: 1; }
+        /* Mic mute bounce */
+        @keyframes mute-bounce { 0% { transform: scale(1); } 40% { transform: scale(0.85); } 70% { transform: scale(1.08); } 100% { transform: scale(1); } }
+        #muteBtn.mute-anim { animation: mute-bounce 0.3s var(--ease-spring); }
+        /* Status & Result */
+        #status {
+            text-align: center; font-size: var(--fs-sm); font-weight: var(--fw-medium);
+            letter-spacing: var(--ls-wide); color: var(--text-secondary);
+            padding: var(--space-xs) var(--space-sm); background: var(--surface-raised);
+            border-radius: var(--space-xs); margin: var(--space-2xs) 0; flex-shrink: 0;
+            transition: color var(--duration-normal) var(--ease-out),
+                        background-color var(--duration-normal) var(--ease-out);
+            border: 1px solid var(--border-subtle);
+        }
+        #status.recording { color: var(--recording); background: var(--recording-muted); border-color: var(--recording-muted); font-size: var(--fs-base); font-weight: 600; }
+        #status.paused { color: var(--locked); background: var(--locked-muted); border-color: var(--locked-muted); }
+        #result {
+            text-align: center; font-size: var(--fs-base); color: var(--text-primary);
+            padding: var(--space-xs) var(--space-sm); max-height: 48px;
+            background: var(--surface-raised); border-radius: var(--space-xs);
+            border: 1px solid var(--border-subtle); overflow-y: auto; flex-shrink: 0;
+            scrollbar-width: thin; scrollbar-color: var(--surface-highest) transparent;
+        }
+        #result:empty { display: none; }
+        #result.partial { color: var(--text-tertiary); font-style: italic; }
+        /* Segmented control — iOS-style with sliding indicator */
+        .seg-control { flex-shrink: 0; padding: var(--space-2xs) var(--space-lg); margin: var(--space-2xs) 0; }
+        .seg-control__track {
+            display: flex; position: relative; background: var(--surface-raised);
+            border-radius: var(--space-xs); padding: var(--space-3xs);
+            border: 1px solid var(--border-subtle);
+        }
+        .seg-control__indicator {
+            position: absolute; top: var(--space-3xs); left: var(--space-3xs);
+            width: calc(50% - var(--space-3xs)); height: calc(100% - var(--space-3xs) * 2);
+            background: var(--surface-overlay); border-radius: calc(var(--space-xs) - 2px);
+            transition: transform var(--duration-slow) var(--ease-spring);
+            box-shadow: var(--shadow-sm); z-index: 0;
+        }
+        .seg-control__indicator.right { transform: translateX(100%); }
+        .seg-control__btn {
+            flex: 1; padding: var(--space-xs) 0; border: none; background: transparent;
+            color: var(--text-tertiary); font-family: inherit; font-size: var(--fs-xs);
+            font-weight: var(--fw-semibold); letter-spacing: var(--ls-caps);
+            cursor: pointer; position: relative; z-index: 1;
+            transition: color var(--duration-normal) var(--ease-out),
+                        transform var(--duration-normal) var(--ease-spring);
+            border-radius: calc(var(--space-xs) - 2px);
+        }
+        .seg-control__btn:active { transform: scale(0.93); }
+        .seg-control__btn--active { color: var(--text-primary); }
+        /* Pad */
+        #pad {
+            flex: 1; min-height: 120px; background: var(--surface-raised);
+            border-radius: var(--space-sm); margin: var(--space-xs) 0;
+            margin-bottom: calc(var(--key-row-height) + var(--space-sm) + var(--safe-area-bottom));
+            position: relative; display: flex; align-items: center; justify-content: center;
+            border: 1px solid var(--border-subtle);
+            transition: border-color var(--duration-normal) var(--ease-out),
+                        background-color var(--duration-normal) var(--ease-out);
+        }
+        #pad.touching { border-color: var(--border-medium); background: var(--surface-overlay); }
+        #pad::after { content: attr(data-label); color: var(--text-tertiary); font-size: var(--fs-lg); font-weight: var(--fw-semibold); letter-spacing: var(--ls-caps); pointer-events: none; opacity: 0.4; }
+        /* Key row */
+        .key-row {
+            display: flex; gap: var(--space-xs); padding: var(--space-xs) var(--space-sm);
+            padding-bottom: calc(var(--space-xs) + var(--safe-area-bottom));
+            justify-content: center; position: fixed; bottom: 0; left: 0; right: 0;
+            background: var(--surface-base); z-index: var(--z-sticky);
+            border-top: 1px solid var(--border-subtle);
+        }
+        .key-btn {
+            flex: 1; max-width: 160px; height: var(--key-row-height);
+            border: none; border-radius: var(--space-xs);
+            background: var(--surface-overlay); color: var(--text-primary);
+            font-family: inherit; font-size: var(--fs-base); font-weight: var(--fw-medium);
+            cursor: pointer;
+            transition: background-color var(--duration-fast) var(--ease-out),
+                        transform var(--duration-normal) var(--ease-spring);
+        }
+        .key-btn:active { background: var(--surface-highest); transform: scale(0.94); }
+        .key-btn.active { background: rgba(52,199,89,0.08); }
+        /* Settings sheet */
+        .settings-backdrop {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+            backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+            z-index: var(--z-backdrop); opacity: 0; pointer-events: none;
+            transition: opacity var(--duration-slow) var(--ease-out);
+        }
+        .settings-backdrop.open { opacity: 1; pointer-events: auto; }
+        .settings-sheet {
+            position: fixed; bottom: 0; left: 0; width: 100%; max-height: 70vh;
+            background: var(--surface-sheet); border-radius: var(--space-md) var(--space-md) 0 0;
+            padding: var(--space-sm) var(--space-md);
+            padding-bottom: calc(var(--space-md) + var(--safe-area-bottom));
+            z-index: var(--z-sheet); transform: translateY(100%);
+            transition: transform var(--duration-slow) var(--ease-spring);
+            overflow-y: auto; border-top: 1px solid var(--border-medium);
+        }
+        .settings-sheet.open { transform: translateY(0); }
+        .sheet-handle { width: 36px; height: 4px; background: var(--text-tertiary); border-radius: 2px; margin: 0 auto var(--space-md); opacity: 0.6; }
+        .setting-row { display: flex; align-items: center; justify-content: space-between; padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-subtle); gap: var(--space-sm); }
+        .setting-row:last-of-type { border-bottom: none; }
+        .setting-row label { font-size: var(--fs-base); font-weight: var(--fw-medium); color: var(--text-primary); flex-shrink: 0; }
+        .setting-row input[type=range] { width: 140px; height: 4px; -webkit-appearance: none; appearance: none; background: var(--surface-highest); border-radius: 2px; outline: none; }
+        .setting-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%; background: var(--text-primary); cursor: pointer; box-shadow: var(--shadow-md); transition: transform var(--duration-normal) var(--ease-spring), box-shadow var(--duration-normal) var(--ease-out); }
+        .setting-row input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); box-shadow: var(--shadow-md); }
+        .setting-row input[type=range]::-moz-range-track { height: 4px; background: var(--surface-highest); border-radius: 2px; border: none; }
+        .setting-row input[type=range]::-moz-range-thumb { width: 22px; height: 22px; border-radius: 50%; background: var(--text-primary); cursor: pointer; box-shadow: var(--shadow-md); border: none; }
+        .setting-row span { width: 40px; text-align: right; font-size: var(--fs-sm); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+        .setting-row select { padding: var(--space-xs) var(--space-sm); border-radius: var(--space-xs); border: 1px solid var(--border-medium); background: var(--surface-highest); color: var(--text-primary); font-family: inherit; font-size: var(--fs-sm); -webkit-appearance: none; appearance: none; transition: border-color var(--duration-normal) var(--ease-out), box-shadow var(--duration-normal) var(--ease-out); outline: none; }
+        .setting-row select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-muted); }
+        .btn-done { width: 100%; padding: var(--space-sm); margin-top: var(--space-md); background: var(--surface-overlay); border: 1px solid var(--border-medium); border-radius: var(--space-xs); color: var(--text-primary); font-family: inherit; font-size: var(--fs-md); font-weight: var(--fw-semibold); letter-spacing: var(--ls-wide); cursor: pointer; transition: background-color var(--duration-fast) var(--ease-out), transform var(--duration-normal) var(--ease-spring); }
+        .btn-done:active { background: var(--surface-highest); transform: scale(0.96); }
+        .btn-done--flush { margin-top: 0; }
+        /* Calibration status */
+        .calib-status { font-size: var(--fs-sm); color: var(--text-tertiary); margin-top: var(--space-2xs); text-align: center; transition: color var(--duration-normal) var(--ease-out); }
+        .calib-status.set { color: var(--accent); }
+        /* Recording pulse animation */
+        @keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(255,59,48,0.4); } 70% { box-shadow: 0 0 0 10px rgba(255,59,48,0); } 100% { box-shadow: 0 0 0 0 rgba(255,59,48,0); } }
+        @media (prefers-reduced-motion: reduce) { .mic-btn.holding .mic-btn__pulse, .mic-btn.locked .mic-btn__pulse, .mic-btn.locked::after, .mic-btn.holding::before, #muteBtn.mute-anim, #centerBtn.sampling { animation: none; } .mic-btn.waiting { transform: none; } }
+        /* Welcome overlay */
+        .welcome { position: fixed; inset: 0; z-index: 200; background: var(--surface-base); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--space-lg); padding: var(--space-xl); text-align: center; transition: opacity var(--duration-slow) var(--ease-out); }
+        .welcome.fade-out { opacity: 0; pointer-events: none; }
+        .welcome h1 { font-size: 1.8rem; font-weight: var(--fw-semibold); letter-spacing: var(--ls-wide); color: var(--text-primary); }
+        .welcome p { font-size: var(--fs-base); color: var(--text-secondary); line-height: 1.6; max-width: 280px; }
+        .welcome button { margin-top: var(--space-md); padding: var(--space-xs) var(--space-xl); font-size: var(--fs-base); font-weight: var(--fw-semibold); color: #fff; background: var(--accent); border: none; border-radius: 999px; cursor: pointer; letter-spacing: var(--ls-wide); transition: transform var(--duration-fast) var(--ease-spring), opacity var(--duration-fast); }
+        .welcome button:active { transform: scale(0.95); opacity: 0.85; }
+        /* Screen mirror overlay */
+        .screen-overlay { position: fixed; inset: 0; z-index: 250; background: #000; display: none; flex-direction: column; }
+        .screen-overlay.active { display: flex; }
+        .screen-overlay canvas { display: block; max-width: 100%; max-height: 100%; margin: auto; }
+        .screen-overlay__bar { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; justify-content: space-between; padding: var(--space-xs) var(--space-sm); background: rgba(0,0,0,0.6); z-index: 251; }
+        .screen-overlay__bar button { background: var(--surface-overlay); color: var(--text-primary); border: none; border-radius: 8px; padding: var(--space-2xs) var(--space-sm); font-size: var(--fs-sm); cursor: pointer; }
+        .screen-overlay__bar span { color: var(--text-secondary); font-size: var(--fs-xs); font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <div class="controls__primary">
+            <div class="mic-btn-wrapper">
+                <button class="mic-btn" id="micBtn" aria-label="Record audio">
+                    <span class="mic-btn__pulse"></span>
+                    <span class="mic-btn__icon mic-btn__icon--mic">
+                        <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
+                    </span>
+                    <span class="mic-btn__icon mic-btn__icon--lock" style="display:none">
+                        <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/></svg>
+                    </span>
+                </button>
+                <span class="mic-btn__hint" id="micHint"></span>
+            </div>
+        </div>
+        <div class="controls__secondary">
+            <button class="ctrl-btn ctrl-btn--secondary" id="muteBtn" aria-label="Mute microphone">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" style="pointer-events:none"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
+            </button>
+            <button class="ctrl-btn ctrl-btn--secondary" id="centerBtn" disabled aria-label="Set gyro center">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="pointer-events:none"><circle cx="12" cy="12" r="3"/><line x1="12" y1="2" x2="12" y2="7"/><line x1="12" y1="17" x2="12" y2="22"/><line x1="2" y1="12" x2="7" y2="12"/><line x1="17" y1="12" x2="22" y2="12"/></svg>
+            </button>
+            <button class="ctrl-btn ctrl-btn--secondary" id="screenBtn" aria-label="Screen mirror">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" style="pointer-events:none"><path d="M21 2H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7v2H8v2h8v-2h-2v-2h7c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H3V4h18v12z"/></svg>
+            </button>
+            <button class="ctrl-btn ctrl-btn--secondary ctrl-btn--icon-only" id="settingsBtn" aria-label="Settings">
+                <span class="ctrl-btn__icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1112 8.4a3.6 3.6 0 010 7.2z"/></svg></span>
+            </button>
+        </div>
+    </div>
+    <div id="status" aria-live="polite">Loading...</div>
+    <div id="result" aria-live="polite"></div>
+    <div class="seg-control" id="modeToggle" role="tablist" aria-label="Input mode">
+        <div class="seg-control__track">
+            <div class="seg-control__indicator" id="segIndicator"></div>
+            <button class="seg-control__btn seg-control__btn--active" id="modeTrackpad" role="tab" aria-selected="true">TRACKPAD</button>
+            <button class="seg-control__btn" id="modeGyro" role="tab" aria-selected="false">GYROSCOPE</button>
+        </div>
+    </div>
+    <div id="pad" data-label="TRACKPAD"></div>
+    <div class="key-row">
+        <button class="key-btn" id="backspaceBtn" aria-label="Backspace">⌫ Backspace</button>
+        <button class="key-btn" id="enterBtn" aria-label="Enter">Enter ↵</button>
+    </div>
+    <div class="settings-backdrop" id="settingsBackdrop"></div>
+    <div class="settings-sheet" id="settingsSheet" role="dialog" aria-modal="true" aria-label="Settings">
+        <div class="sheet-handle"></div>
+        <div class="setting-row">
+            <label>Trackpad Speed</label>
+            <input type="range" min="0.5" max="3" step="0.1" value="1.5" id="sensitivitySlider">
+            <span id="sensitivityVal">1.5x</span>
+        </div>
+        <!-- Input Mode selector removed: use main screen segmented control -->
+        <div id="gyroSettings" style="display: none;">
+            <div class="setting-row">
+                <label>Gyro Sensitivity</label>
+                <input type="range" min="1" max="10" step="1" value="3" id="gyroSensitivity">
+                <span id="gyroSensVal">3x</span>
+            </div>
+            <div class="setting-row">
+                <button id="calibrateBtn" class="btn-done btn-done--flush">
+                    Set Center
+                </button>
+            </div>
+            <div id="calibStatus" class="calib-status">
+                Not calibrated
+            </div>
+            <div class="setting-row" style="margin-top: var(--space-xs);">
+                <label for="autoSwitchChk" style="flex:1; cursor:pointer;">Auto-switch to Trackpad on mouse</label>
+                <input type="checkbox" id="autoSwitchChk" checked style="width:18px; height:18px; accent-color:var(--accent); cursor:pointer;">
+            </div>
+        </div>
+        <button class="btn-done" id="settingsDone">Done</button>
+    </div>
+
+    <div class="screen-overlay" id="screenOverlay">
+        <div class="screen-overlay__bar">
+            <button id="screenBackBtn">Back</button>
+            <select id="screenRes" style="background:var(--surface-overlay);color:var(--text-primary);border:none;border-radius:8px;padding:4px 8px;font-size:var(--fs-xs);">
+                <option value="">Native</option>
+                <option value="1080p" selected>1080p</option>
+                <option value="720p">720p</option>
+                <option value="480p">480p</option>
+            </select>
+            <span id="screenFps">--</span>
+        </div>
+        <canvas id="screenCanvas"></canvas>
+    </div>
+
+    <div class="welcome" id="welcome">
+        <h1>Sanketra</h1>
+        <p>Turn your phone into a wireless mic &amp; trackpad. Speak to type. Swipe to move cursor.</p>
+        <button id="welcomeBtn">Get Started</button>
+    </div>
+
+    <script>
+        // Auth token: read from URL, move to sessionStorage, strip from URL bar
+        // Prevents token leaking in browser history, referer headers, and shoulder surfing
+        let _wsToken = new URLSearchParams(location.search).get('token') || '';
+        if (_wsToken) {
+            sessionStorage.setItem('_wsToken', _wsToken);
+            const cleanUrl = location.origin + location.pathname;
+            history.replaceState(null, '', cleanUrl);
+        } else {
+            _wsToken = sessionStorage.getItem('_wsToken') || '';
+        }
+
+        // Auth failure recovery: show re-auth UI (re-scan QR which has token embedded)
+        let _authRecoveryInProgress = false;
+        function handleAuthFailure(source) {
+            if (_authRecoveryInProgress) return;
+            _authRecoveryInProgress = true;
+            console.warn(source + ': auth failed (4401), pair code required — showing re-auth UI');
+            sessionStorage.removeItem('_wsToken');
+            _wsToken = '';
+            _authRecoveryInProgress = false;
+            _showAuthLostUI();
+        }
+
+        function _showAuthLostUI() {
+            const el = document.getElementById('status');
+            if (!el) return;
+            el.innerHTML = 'Session expired &mdash; <a href="javascript:void(0)" style="color:#4fc3f7;text-decoration:underline" id="_refresh_btn">Retry</a> or re-scan QR from server';
+            const refreshBtn = document.getElementById('_refresh_btn');
+            if (refreshBtn) refreshBtn.onclick = () => {
+                el.textContent = 'Reconnecting...';
+                _tokenCheckRetries = 0;
+                _authRecoveryInProgress = false;
+                // If token was cleared, just reload to try fresh
+                if (!_wsToken) { window.location.reload(); return; }
+                _validateTokenOnLoad().then(valid => {
+                    if (valid) connectTrackpad();
+                });
+            };
+        }
+
+        // Validate token on page load — detect stale tokens before any WS connects
+        let _tokenValid = false;
+        let _tokenCheckRetries = 0;
+        const _TOKEN_CHECK_MAX_RETRIES = 10;
+        async function _validateTokenOnLoad() {
+            if (!_wsToken) {
+                // No token at all — first visit without QR or cleared session
+                const el = document.getElementById('status');
+                if (el) el.textContent = 'Scan QR code from server to connect';
+                return false;
+            }
+            try {
+                const resp = await fetch('/api/token-check?token=' + encodeURIComponent(_wsToken));
+                if (resp.ok) {
+                    _tokenValid = true;
+                    return true;
+                }
+                // Token is stale — try recovery
+                console.warn('Token stale on load, attempting re-auth...');
+                await handleAuthFailure('Page load');
+                return _tokenValid;
+            } catch (e) {
+                // Server unreachable — retry with backoff (server may be restarting)
+                _tokenCheckRetries++;
+                if (_tokenCheckRetries > _TOKEN_CHECK_MAX_RETRIES) {
+                    console.error('Server unreachable after retries');
+                    const el = document.getElementById('status');
+                    if (el) el.textContent = 'Server unreachable \u2014 check connection and refresh';
+                    return false;
+                }
+                const delay = Math.min(2000 * _tokenCheckRetries, 10000);
+                console.warn('Token check failed (server down?), retry ' + _tokenCheckRetries + ' in ' + delay + 'ms...', e);
+                await new Promise(r => setTimeout(r, delay));
+                return _validateTokenOnLoad();
+            }
+        }
+
+        // Welcome overlay — show only once (localStorage flag)
+        const welcomeEl = document.getElementById('welcome');
+        if (localStorage.getItem('sanketra_welcomed')) {
+            welcomeEl.style.display = 'none';
+        }
+        const dismissWelcome = () => {
+            localStorage.setItem('sanketra_welcomed', '1');
+            welcomeEl.classList.add('fade-out');
+            setTimeout(() => welcomeEl.style.display = 'none', 350);
+        };
+        document.getElementById('welcomeBtn').addEventListener('click', dismissWelcome);
+        welcomeEl.addEventListener('click', (e) => { if (e.target === welcomeEl) dismissWelcome(); });
+
+        // Protocol constants
+        const MSG_AUDIO_FRAME = 0x01;
+        const MSG_START_SESSION = 0x10;
+        const MSG_END_SESSION = 0x11;
+        const MSG_FINAL = 0x02;
+        const MSG_VAD_STATUS = 0x03;
+        const MSG_PARTIAL = 0x04;
+        const MSG_BACKPRESSURE = 0xFE;
+        const MSG_SESSION_READY = 0xF0;
+        const MSG_SESSION_DONE = 0xF1;
+        const MSG_INPUT_PAUSED = 0xF2;
+        const MSG_INPUT_RESUMED = 0xF3;
+        const MSG_ERROR = 0xFF;
+
+        const pad = document.getElementById('pad');
+        const micBtn = document.getElementById('micBtn');
+        const micHint = document.getElementById('micHint');
+        const micIconMic = micBtn.querySelector('.mic-btn__icon--mic');
+        const micIconLock = micBtn.querySelector('.mic-btn__icon--lock');
+        const muteBtn = document.getElementById('muteBtn');
+        const status = document.getElementById('status');
+        const result = document.getElementById('result');
+        const settingsBtn = document.getElementById('settingsBtn');
+        const centerBtn = document.getElementById('centerBtn');
+        const modeTrackpadBtn = document.getElementById('modeTrackpad');
+        const modeGyroBtn = document.getElementById('modeGyro');
+        const settingsSheet = document.getElementById('settingsSheet');
+        const sensitivitySlider = document.getElementById('sensitivitySlider');
+        const sensitivityVal = document.getElementById('sensitivityVal');
+        const settingsDone = document.getElementById('settingsDone');
+
+        // ===== SETTINGS =====
+        let sensitivity = parseFloat(localStorage.getItem('tpSensitivity') || '1.5');
+        sensitivitySlider.value = sensitivity;
+        sensitivityVal.textContent = sensitivity + 'x';
+
+        const settingsBackdrop = document.getElementById('settingsBackdrop');
+        function openSettings() { haptic(); settingsSheet.classList.add('open'); settingsBackdrop.classList.add('open'); settingsBtn.classList.add('open'); settingsDone.focus(); }
+        function closeSettings() { haptic(); settingsSheet.classList.remove('open'); settingsBackdrop.classList.remove('open'); settingsBtn.classList.remove('open'); settingsBtn.focus(); }
+        settingsBtn.onclick = openSettings;
+        settingsDone.onclick = closeSettings;
+        settingsBackdrop.onclick = closeSettings;
+        // Focus trap inside settings dialog
+        settingsSheet.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') { closeSettings(); return; }
+            if (e.key !== 'Tab') return;
+            const focusable = settingsSheet.querySelectorAll('button, input, select, [tabindex]:not([tabindex="-1"])');
+            if (!focusable.length) return;
+            const first = focusable[0], last = focusable[focusable.length - 1];
+            if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+            else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        });
+
+        // Center button — set gyro center (debounced 600ms)
+        let _centerDebounce = 0;
+        centerBtn.ontouchstart = async (e) => {
+            e.preventDefault();
+            if (inputMode !== 'gyro') return;
+            const now = Date.now();
+            if (now - _centerDebounce < 600) return;
+            _centerDebounce = now;
+            const hasPermission = await requestGyroPermission();
+            if (!hasPermission) return;
+            haptic();
+            centerBtn.classList.add('sampling');
+            await fetchScreenSize();
+            const samples = [];
+            const interval = setInterval(() => samples.push({...currentOrientation}), 50);
+            setTimeout(() => {
+                clearInterval(interval);
+                if (samples.length === 0) samples.push({...currentOrientation});
+                gyroCenter = {
+                    alpha: samples.reduce((s, o) => s + o.alpha, 0) / samples.length,
+                    beta: samples.reduce((s, o) => s + o.beta, 0) / samples.length,
+                };
+                localStorage.setItem('gyroCenter', JSON.stringify(gyroCenter));
+                window.gyroLastPos = {x: screenSize.w / 2, y: screenSize.h / 2};
+                centerBtn.classList.remove('sampling');
+                centerBtn.classList.add('set');
+                updateCalibStatus();
+                status.textContent = 'Center set!';
+            }, 500);
+        };
+        sensitivitySlider.oninput = () => {
+            sensitivity = parseFloat(sensitivitySlider.value);
+            sensitivityVal.textContent = sensitivity + 'x';
+            localStorage.setItem('tpSensitivity', sensitivity);
+        };
+
+        // ===== GYROSCOPE MODE =====
+        let inputMode = localStorage.getItem('inputMode') || 'trackpad';
+        let gyroSensitivity = parseFloat(localStorage.getItem('gyroSensitivity') || '3');
+        let gyroCenter = JSON.parse(localStorage.getItem('gyroCenter') || 'null');
+        let gyroAutoSwitch = localStorage.getItem('gyroAutoSwitch') !== 'false';
+        const autoSwitchChk = document.getElementById('autoSwitchChk');
+        autoSwitchChk.checked = gyroAutoSwitch;
+        autoSwitchChk.addEventListener('change', () => { gyroAutoSwitch = autoSwitchChk.checked; localStorage.setItem('gyroAutoSwitch', gyroAutoSwitch); });
+        // Discard old center format (had gamma, needs alpha)
+        if (gyroCenter && gyroCenter.alpha === undefined) {
+            gyroCenter = null;
+            localStorage.removeItem('gyroCenter');
+        }
+        let screenSize = {w: 1920, h: 1080};
+        let currentOrientation = {alpha: 0, beta: 0, gamma: 0};
+        let lastGyroUpdate = 0;
+        const GYRO_UPDATE_INTERVAL = 16; // ~60fps
+
+        // A19-P2-1: inputModeSelect was dead code — element id="inputMode" never exists
+        // Mode switching is handled by the segmented control (data-mode buttons) and switchMode()
+        const gyroSettings = document.getElementById('gyroSettings');
+        const gyroSensSlider = document.getElementById('gyroSensitivity');
+        const gyroSensVal = document.getElementById('gyroSensVal');
+        const calibrateBtn = document.getElementById('calibrateBtn');
+        async function fetchScreenSize() {
+            try {
+                const resp = await fetch('/api/screen', {
+                    headers: {'Authorization': 'Bearer ' + _wsToken}
+                });
+                const data = await resp.json();
+                screenSize = {w: data.w, h: data.h};
+            } catch (e) {
+                console.warn('Could not fetch screen size, using 1920x1080');
+            }
+        }
+
+        // Initialize UI
+        gyroSensSlider.value = gyroSensitivity;
+        gyroSensVal.textContent = gyroSensitivity + 'x';
+        gyroSettings.style.display = (inputMode === 'gyro') ? 'block' : 'none';
+        updateUIMode();
+        if (inputMode === 'gyro') {
+            fetchScreenSize();
+            // iOS requires requestPermission inside user gesture — don't call on load.
+            // Non-iOS browsers don't need requestPermission, so we can add listener directly.
+            if (typeof DeviceOrientationEvent.requestPermission !== 'function') {
+                requestGyroPermission();
+            }
+        }
+
+        // Lock to portrait (prevents chaos in gyro mode)
+        try { screen.orientation.lock('portrait').catch(() => {}); } catch(e) {}
+
+        // Mode switching via segmented control buttons
+        modeTrackpadBtn.onclick = () => { haptic(); switchMode('trackpad'); };
+        modeGyroBtn.onclick = () => { haptic(); switchMode('gyro'); };
+
+        gyroSensSlider.oninput = () => {
+            gyroSensitivity = parseFloat(gyroSensSlider.value);
+            gyroSensVal.textContent = gyroSensitivity + 'x';
+            localStorage.setItem('gyroSensitivity', gyroSensitivity);
+        };
+
+        function updateUIMode() {
+            const isGyro = inputMode === 'gyro';
+            centerBtn.disabled = !isGyro;
+            // Segmented control — slide indicator pill
+            const indicator = document.getElementById('segIndicator');
+            if (indicator) indicator.classList.toggle('right', isGyro);
+            modeTrackpadBtn.classList.toggle('seg-control__btn--active', !isGyro);
+            modeGyroBtn.classList.toggle('seg-control__btn--active', isGyro);
+            modeTrackpadBtn.setAttribute('aria-selected', String(!isGyro));
+            modeGyroBtn.setAttribute('aria-selected', String(isGyro));
+            pad.dataset.label = isGyro ? 'GYRO POINTER' : 'TRACKPAD';
+        }
+
+        function switchMode(newMode) {
+            if (inputMode === newMode) return;
+            // Force-cleanup stuck gesture state
+            _cancelBufferedClick();
+            if (scrolling) { scrolling = false; sendTp({t: 'ss'}); }
+            if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = null; }
+            if (dragging) { dragging = false; sendTp({t: 'd', a: 'up'}); }
+            moved = false;
+            fingerCount = 0;
+            totalDist = 0;
+            scrollVelocity = 0;
+            lastScrollTime = 0;
+
+            inputMode = newMode;
+            localStorage.setItem('inputMode', inputMode);
+            gyroSettings.style.display = (inputMode === 'gyro') ? 'block' : 'none';
+            updateUIMode();
+            if (inputMode === 'gyro') {
+                requestGyroPermission();
+                fetchScreenSize();
+                updateCalibStatus();
+            } else {
+                if (!tpConnected) connectTrackpad();
+            }
+        }
+
+        // iOS Permission Handling
+        async function requestGyroPermission() {
+            if (!window.DeviceOrientationEvent) {
+                status.textContent = 'Gyroscope not supported';
+                return false;
+            }
+            // Always remove old listener first to prevent accumulation across mode switches
+            window.removeEventListener('deviceorientation', handleDeviceOrientation);
+            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+                try {
+                    const permission = await DeviceOrientationEvent.requestPermission();
+                    if (permission === 'granted') {
+                        window.addEventListener('deviceorientation', handleDeviceOrientation);
+                        // Gyro permission granted
+                        return true;
+                    } else {
+                        status.textContent = 'Gyro permission denied';
+                        return false;
+                    }
+                } catch (err) {
+                    console.error('Permission error:', err);
+                    status.textContent = 'Gyro permission error';
+                    return false;
+                }
+            } else {
+                window.addEventListener('deviceorientation', handleDeviceOrientation);
+                // Gyro activated
+                return true;
+            }
+        }
+
+        function handleDeviceOrientation(event) {
+            currentOrientation = {
+                alpha: event.alpha || 0,
+                beta: event.beta || 0,
+                gamma: event.gamma || 0
+            };
+            if (inputMode === 'gyro' && gyroCenter && tpConnected) {
+                updateCursorFromGyro();
+            }
+        }
+
+        // Set Center — capture current phone orientation as screen center
+        let _calibDebounce = 0;
+        calibrateBtn.onclick = async () => {
+            const now = Date.now();
+            if (now - _calibDebounce < 600) return;
+            _calibDebounce = now;
+            const hasPermission = await requestGyroPermission();
+            if (!hasPermission) return;
+            haptic();
+            calibrateBtn.textContent = 'Sampling...';
+            calibrateBtn.style.opacity = '0.5';
+            await fetchScreenSize();
+            const samples = [];
+            const interval = setInterval(() => samples.push({...currentOrientation}), 50);
+            setTimeout(() => {
+                clearInterval(interval);
+                if (samples.length === 0) samples.push({...currentOrientation});
+                gyroCenter = {
+                    alpha: samples.reduce((s, o) => s + o.alpha, 0) / samples.length,
+                    beta: samples.reduce((s, o) => s + o.beta, 0) / samples.length,
+                };
+                localStorage.setItem('gyroCenter', JSON.stringify(gyroCenter));
+                window.gyroLastPos = {x: screenSize.w / 2, y: screenSize.h / 2};
+                calibrateBtn.textContent = 'Set Center';
+                calibrateBtn.style.opacity = '1';
+                updateCalibStatus();
+                status.textContent = 'Center set!';
+            }, 500);
+        };
+
+        // Helper functions
+        function normalizeAngle(angle) {
+            while (angle > 180) angle -= 360;
+            while (angle < -180) angle += 360;
+            return angle;
+        }
+
+        function updateCursorFromGyro() {
+            const now = Date.now();
+            if (now - lastGyroUpdate < GYRO_UPDATE_INTERVAL) return;
+            lastGyroUpdate = now;
+
+            // Direct mapping: orientation delta → screen pixels
+            // alpha (yaw) → X axis, beta (pitch) → Y axis
+            const pxPerDeg = gyroSensitivity * 20;
+            let da = currentOrientation.alpha - gyroCenter.alpha;
+            // Handle alpha wrapping (0↔360 boundary)
+            if (da > 180) da -= 360;
+            if (da < -180) da += 360;
+            const db = currentOrientation.beta - gyroCenter.beta;
+
+            let x = screenSize.w / 2 + da * pxPerDeg;
+            let y = screenSize.h / 2 + db * pxPerDeg;
+
+            // Clamp to screen bounds
+            x = Math.max(0, Math.min(screenSize.w, x));
+            y = Math.max(0, Math.min(screenSize.h, y));
+
+            // Adaptive smoothing — fast move = responsive, still = stable
+            if (!window.gyroLastPos) window.gyroLastPos = {x, y};
+            const dx = x - window.gyroLastPos.x;
+            const dy = y - window.gyroLastPos.y;
+            const speed = Math.sqrt(dx * dx + dy * dy);
+            const alpha = Math.min(0.85, Math.max(0.3, speed / 60));
+            const smoothX = (1 - alpha) * window.gyroLastPos.x + alpha * x;
+            const smoothY = (1 - alpha) * window.gyroLastPos.y + alpha * y;
+            window.gyroLastPos = {x: smoothX, y: smoothY};
+
+            // Send ABSOLUTE position
+            if (tpConnected) {
+                sendTp({t: 'a', x: Math.round(smoothX), y: Math.round(smoothY)});
+            }
+
+        }
+
+        function updateCalibStatus() {
+            const statusEl = document.getElementById('calibStatus');
+            if (gyroCenter) {
+                statusEl.textContent = 'Center set — point and move';
+                statusEl.classList.add('set');
+            } else {
+                statusEl.textContent = 'Point at screen center, then Set Center';
+                statusEl.classList.remove('set');
+            }
+        }
+
+
+        // ===== TRACKPAD =====
+        let tpWs = null;
+        let lastX = 0, lastY = 0;
+        let tpConnected = false;
+        let touchStart = 0;
+        let moved = false;
+        let fingerCount = 0;
+        let maxFingers = 0;
+        let lastTap = 0;
+        let dragging = false;
+        let scrolling = false;
+        let scrollAccum = 0;
+        let scrollRaf = null;
+        // Momentum scrolling state
+        let scrollVelocity = 0;
+        let lastScrollTime = 0;
+        let momentumRaf = null;
+        let lastMomentumTime = 0;
+        const SCROLL_FRICTION = 0.95;      // per-tick damping, normalized to 60fps via dt
+        const SCROLL_MIN_VELOCITY = 0.3;   // stop threshold (sub-pixel)
+
+        let _tpReconnectTimer = null;
+        function connectTrackpad() {
+            // Don't attempt WS with empty/cleared token
+            if (!_wsToken) return;
+            // Skip only if WS is already open or connecting
+            if (tpWs && (tpWs.readyState === WebSocket.OPEN || tpWs.readyState === WebSocket.CONNECTING)) return;
+            // Clean up stale reference (CLOSING or CLOSED state)
+            if (tpWs) { tpWs = null; tpConnected = false; }
+            tpWs = new WebSocket('wss://' + location.host + '/ws-tp');
+            tpWs.onopen = () => {
+                tpWs.send(JSON.stringify({t:'auth',token:_wsToken}));
+                tpConnected = true;
+            };
+            tpWs.onclose = (e) => {
+                tpWs = null; tpConnected = false;
+                if (e.code === 4401) {
+                    handleAuthFailure('Trackpad WS');
+                    return;
+                }
+                // Auto-reconnect after 500ms if not already scheduled
+                if (!_tpReconnectTimer) {
+                    _tpReconnectTimer = setTimeout(() => { _tpReconnectTimer = null; connectTrackpad(); }, 500);
+                }
+            };
+            tpWs.onerror = () => { console.error('Trackpad WS error'); };
+            tpWs.binaryType = 'arraybuffer';
+            tpWs.onmessage = (e) => {
+                if (typeof e.data === 'string') {
+                    try {
+                        const msg = JSON.parse(e.data);
+                        if (msg.t === 'cp') {
+                            // Cursor position update for screen mirror overlay
+                            if (typeof updateCursorOverlay === 'function') {
+                                updateCursorOverlay(msg.x, msg.y, msg.sw, msg.sh);
+                            }
+                        } else if (msg.error) {
+                            status.textContent = 'Error: ' + msg.error;
+                        }
+                    } catch(_) {}
+                    return;
+                }
+                const data = new Uint8Array(e.data);
+                const type = data[0];
+                if (type === MSG_INPUT_PAUSED) {
+                    if (gyroAutoSwitch && inputMode === 'gyro') switchMode('trackpad');
+                    status.textContent = 'Paused \u2014 laptop input active';
+                    status.classList.add('paused');
+                    status.classList.remove('recording');
+                } else if (type === MSG_INPUT_RESUMED) {
+                    status.textContent = sessionActive ? 'Listening...' : 'Ready';
+                    status.classList.remove('paused');
+                    if (sessionActive) status.classList.add('recording');
+                }
+            };
+        }
+
+        function sendTp(obj) {
+            if (tpConnected && tpWs?.readyState === 1) {
+                tpWs.send(JSON.stringify(obj));
+            } else {
+                // WS dead — trigger reconnect and queue the message for retry
+                connectTrackpad();
+            }
+        }
+
+        // Validate token before connecting any WebSocket
+        _validateTokenOnLoad().then(valid => {
+            if (valid) connectTrackpad();
+        });
+
+        // Movement threshold (px) — finger jitter below this doesn't count as "moved"
+        const MOVE_THRESHOLD = 8;
+        const LONG_PRESS_MS = 300;
+        const DOUBLE_TAP_WINDOW = 300;  // ms to wait before sending buffered click
+        let startX = 0, startY = 0;
+        let totalDist = 0;
+        let longPressTimer = null;
+        let longPressFired = false;
+        // Double-tap-drag buffering (P1-10): buffer click on first tap,
+        // cancel it if second tap arrives within DOUBLE_TAP_WINDOW to start drag instead.
+        let _bufferedClickTimer = null;
+        let _bufferedClickBtn = 1;
+
+        function _flushBufferedClick() {
+            if (_bufferedClickTimer) {
+                clearTimeout(_bufferedClickTimer);
+                _bufferedClickTimer = null;
+                sendTp({t: 'c', b: _bufferedClickBtn});
+            }
+        }
+
+        function _cancelBufferedClick() {
+            if (_bufferedClickTimer) {
+                clearTimeout(_bufferedClickTimer);
+                _bufferedClickTimer = null;
+            }
+        }
+
+        function onTouchStart(e) {
+            e.preventDefault();
+            e.currentTarget.classList.add('touching');
+            if (!tpConnected) connectTrackpad();
+            const now = Date.now();
+            fingerCount = e.touches.length;
+            maxFingers = Math.max(maxFingers, fingerCount);
+            lastX = e.touches[0].clientX;
+            lastY = e.touches[0].clientY;
+
+            if (fingerCount === e.changedTouches.length) {
+                maxFingers = fingerCount;
+                if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = null; sendTp({t: 'ss'}); }
+                touchStart = now;
+                moved = false;
+                totalDist = 0;
+                longPressFired = false;
+                startX = lastX;
+                startY = lastY;
+
+                // Double-tap-drag: if there's a buffered click pending and second tap arrives,
+                // cancel the buffered click and start drag instead (no click sent to desktop)
+                if (fingerCount === 1 && _bufferedClickTimer && !dragging) {
+                    _cancelBufferedClick();
+                    dragging = true;
+                    sendTp({t: 'd', a: 'down'});
+                }
+                lastTap = now;
+
+                // Long press = right click (single finger, no drag)
+                if (longPressTimer) clearTimeout(longPressTimer);
+                if (fingerCount === 1 && !dragging) {
+                    longPressTimer = setTimeout(() => {
+                        longPressTimer = null;
+                        if (!moved && !dragging && !scrolling) {
+                            longPressFired = true;
+                            _cancelBufferedClick();
+                            sendTp({t: 'c', b: 3});
+                            if (typeof haptic === 'function') haptic();
+                        }
+                    }, LONG_PRESS_MS);
+                }
+            }
+        }
+        pad.addEventListener('touchstart', onTouchStart, {passive: false});
+
+        function onTouchMove(e) {
+            e.preventDefault();
+            fingerCount = e.touches.length;
+            maxFingers = Math.max(maxFingers, fingerCount);
+            const t = e.touches[0];
+            const dx = t.clientX - lastX;
+            const dy = t.clientY - lastY;
+            lastX = t.clientX;
+            lastY = t.clientY;
+            totalDist += Math.abs(dx) + Math.abs(dy);
+
+            if (totalDist > MOVE_THRESHOLD) {
+                moved = true;
+                if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+            }
+
+            if (fingerCount >= 2 && !dragging) {
+                scrolling = true;
+                if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = null; }
+                const now = performance.now();
+                const scrollDy = dy * sensitivity;
+                if (lastScrollTime > 0) {
+                    const dt = now - lastScrollTime;
+                    if (dt > 0 && dt < 100) scrollVelocity = scrollDy / dt * 16.67;
+                }
+                lastScrollTime = now;
+                scrollAccum += scrollDy;
+                if (!scrollRaf) {
+                    scrollRaf = requestAnimationFrame(() => {
+                        scrollRaf = null;
+                        if (scrollAccum !== 0) {
+                            sendTp({t: 's', dy: scrollAccum});
+                            scrollAccum = 0;
+                        }
+                    });
+                }
+            } else if (fingerCount === 1 && inputMode !== 'gyro') {
+                sendTp({t: 'm', x: dx * sensitivity, y: dy * sensitivity});
+            }
+        }
+        pad.addEventListener('touchmove', onTouchMove, {passive: false});
+
+        function onTouchEnd(e) {
+            e.preventDefault();
+            const remaining = e.touches.length;
+            if (remaining > 0) return;
+            e.currentTarget.classList.remove('touching');
+
+            if (scrolling) {
+                scrolling = false;
+                if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = null; }
+                if (scrollAccum !== 0) sendTp({t: 's', dy: scrollAccum});
+                scrollAccum = 0;
+                if (Math.abs(scrollVelocity) > SCROLL_MIN_VELOCITY) {
+                    let vel = scrollVelocity;
+                    lastMomentumTime = performance.now();
+                    const momentumTick = () => {
+                        const now = performance.now();
+                        const dt = (now - lastMomentumTime) / 16.67; // normalize to 60fps
+                        lastMomentumTime = now;
+                        vel *= Math.pow(SCROLL_FRICTION, dt); // frame-rate independent decay
+                        if (Math.abs(vel) < SCROLL_MIN_VELOCITY) { momentumRaf = null; sendTp({t: 'ss'}); return; }
+                        sendTp({t: 's', dy: vel});
+                        momentumRaf = requestAnimationFrame(momentumTick);
+                    };
+                    momentumRaf = requestAnimationFrame(momentumTick);
+                } else {
+                    sendTp({t: 'ss'});
+                }
+                scrollVelocity = 0;
+                lastScrollTime = 0;
+            }
+            if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+            if (dragging) { dragging = false; sendTp({t: 'd', a: 'up'}); }
+            else if (!longPressFired && !moved && Date.now() - touchStart < 300) {
+                // P1-10: Buffer the click for DOUBLE_TAP_WINDOW ms.
+                // If a second tap arrives within the window, it becomes a drag (no click sent).
+                // If no second tap, the buffered click fires after the delay.
+                const btn = maxFingers >= 2 ? 3 : 1;
+                _cancelBufferedClick();
+                _bufferedClickBtn = btn;
+                _bufferedClickTimer = setTimeout(() => {
+                    _bufferedClickTimer = null;
+                    sendTp({t: 'c', b: _bufferedClickBtn});
+                }, DOUBLE_TAP_WINDOW);
+            }
+            fingerCount = 0;
+            maxFingers = 0;
+            longPressFired = false;
+        }
+        function onTouchCancel(e) {
+            e.preventDefault();
+            e.currentTarget.classList.remove('touching');
+            if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+            _cancelBufferedClick();
+            if (scrolling) { scrolling = false; if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = null; } if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = null; } scrollAccum = 0; scrollVelocity = 0; lastScrollTime = 0; sendTp({t: 'ss'}); }
+            if (dragging) { dragging = false; sendTp({t: 'd', a: 'up'}); }
+            moved = false; fingerCount = 0; totalDist = 0;
+        }
+        pad.addEventListener('touchend', onTouchEnd, {passive: false});
+        pad.addEventListener('touchcancel', onTouchCancel, {passive: false});
+
+        // Attach same touch handlers to screen canvas (trackpad works on screen mirror too)
+        const screenCanvas = document.getElementById('screenCanvas');
+        if (screenCanvas) {
+            screenCanvas.addEventListener('touchstart', onTouchStart, {passive: false});
+            screenCanvas.addEventListener('touchmove', onTouchMove, {passive: false});
+            screenCanvas.addEventListener('touchend', onTouchEnd, {passive: false});
+            screenCanvas.addEventListener('touchcancel', onTouchCancel, {passive: false});
+        }
+
+        // ===== HAPTIC FEEDBACK =====
+        // Audio click (both) + vibration (Android)
+        let clickCtx = null;
+
+        const playClick = () => {
+            try {
+                if (!clickCtx) clickCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (clickCtx.state === 'suspended') clickCtx.resume();
+                const osc = clickCtx.createOscillator();
+                const gain = clickCtx.createGain();
+                osc.connect(gain);
+                gain.connect(clickCtx.destination);
+                osc.frequency.value = 1800;
+                gain.gain.setValueAtTime(0.15, clickCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, clickCtx.currentTime + 0.05);
+                osc.start(clickCtx.currentTime);
+                osc.stop(clickCtx.currentTime + 0.05);
+            } catch(e) {}
+        };
+
+        const _reducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        const haptic = () => {
+            if (_reducedMotion) return;
+            try { navigator.vibrate && navigator.vibrate(30); } catch(e) {}
+            playClick();
+        };
+
+        // Micro haptic for repeat actions (softer vibration + quieter tick)
+        const microHaptic = () => {
+            if (_reducedMotion) return;
+            try { navigator.vibrate && navigator.vibrate(10); } catch(e) {}
+            try {
+                if (!clickCtx) clickCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (clickCtx.state === 'suspended') clickCtx.resume();
+                const osc = clickCtx.createOscillator();
+                const gain = clickCtx.createGain();
+                osc.connect(gain);
+                gain.connect(clickCtx.destination);
+                osc.frequency.value = 1800;
+                gain.gain.setValueAtTime(0.15, clickCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, clickCtx.currentTime + 0.02);
+                osc.start(clickCtx.currentTime);
+                osc.stop(clickCtx.currentTime + 0.02);
+            } catch(e) {}
+        };
+
+        // ===== KEY BUTTONS =====
+        const enterBtn = document.getElementById('enterBtn');
+        const bsBtn = document.getElementById('backspaceBtn');
+
+        // Enter button with glow + haptic
+        enterBtn.addEventListener('touchstart', e => { e.preventDefault(); haptic(); enterBtn.classList.add('active'); sendTp({t: 'k', k: 'enter'}); });
+        enterBtn.addEventListener('touchend', () => enterBtn.classList.remove('active'));
+        enterBtn.addEventListener('touchcancel', () => enterBtn.classList.remove('active'));
+        enterBtn.addEventListener('mousedown', () => { haptic(); enterBtn.classList.add('active'); sendTp({t: 'k', k: 'enter'}); });
+        enterBtn.addEventListener('mouseup', () => enterBtn.classList.remove('active'));
+        enterBtn.addEventListener('mouseleave', () => enterBtn.classList.remove('active'));
+
+        // Backspace with hold-to-repeat, glow + haptic
+        let bsInterval = null;
+        let bsTimeout = null;
+        const startBackspace = () => {
+            haptic();
+            bsBtn.classList.add('active');
+            sendTp({t: 'k', k: 'backspace'});
+            // Wait 300ms before starting repeat with micro haptic
+            bsTimeout = setTimeout(() => {
+                bsInterval = setInterval(() => { microHaptic(); sendTp({t: 'k', k: 'backspace'}); }, 40);
+            }, 300);
+        };
+        const stopBackspace = () => {
+            bsBtn.classList.remove('active');
+            if (bsTimeout) { clearTimeout(bsTimeout); bsTimeout = null; }
+            if (bsInterval) { clearInterval(bsInterval); bsInterval = null; }
+        };
+        bsBtn.addEventListener('touchstart', e => { e.preventDefault(); startBackspace(); });
+        bsBtn.addEventListener('touchend', stopBackspace);
+        bsBtn.addEventListener('touchcancel', stopBackspace);
+        bsBtn.addEventListener('mousedown', startBackspace);
+        bsBtn.addEventListener('mouseup', stopBackspace);
+        bsBtn.addEventListener('mouseleave', stopBackspace);
+
+        // ===== STREAMING AUDIO =====
+        let audioWs = null;
+        let audioContext = null;
+        let workletNode = null;
+        let sourceNode = null;
+        let mediaStream = null;
+        let sessionActive = false;
+        let isStreaming = false;
+        let micState = 'idle';
+        let micLongPressTimer = null;
+        let micTouchStartX = 0;
+        let micTouchStartY = 0;
+        let micTouchId = null;
+        const MIC_LONG_PRESS_MS = 300;
+        const DRAG_LEFT_PX = 60;
+        let paused = false;
+        let isMuted = false;
+        let micReady = false;
+
+        // WebSocket reconnection state
+        let reconnectAttempts = 0;
+        let maxReconnectAttempts = 5;
+        let reconnectDelays = [1000, 2000, 5000, 10000, 10000]; // Exponential backoff
+        let isReconnecting = false;
+
+        function setMicState(newState) {
+            micState = newState;
+            micBtn.classList.remove('waiting', 'holding', 'locked', 'processing');
+            micIconMic.style.display = 'none';
+            micIconLock.style.display = 'none';
+            switch (newState) {
+                case 'idle':
+                    micIconMic.style.display = 'flex';
+                    micHint.textContent = '';
+                    micBtn.disabled = false;
+                    break;
+                case 'waiting':
+                    micBtn.classList.add('waiting');
+                    micIconMic.style.display = 'flex';
+                    micHint.textContent = '';
+                    break;
+                case 'holding':
+                    micBtn.classList.add('holding');
+                    micIconMic.style.display = 'flex';
+                    micHint.textContent = 'Drag left to lock';
+                    break;
+                case 'locked':
+                    micBtn.classList.add('locked');
+                    micIconLock.style.display = 'flex';
+                    micHint.textContent = 'Tap to stop';
+                    break;
+                case 'processing':
+                    micBtn.classList.add('processing');
+                    micIconMic.style.display = 'flex';
+                    micHint.textContent = '';
+                    micBtn.disabled = true;
+                    break;
+            }
+        }
+
+        const processorCode = `
+            class PCMProcessor extends AudioWorkletProcessor {
+                constructor() {
+                    super();
+                    this.ratio = sampleRate / 16000;
+                    this.buffer = new Float32Array(512);
+                    this.idx = 0;
+                    this.resamplePos = 0;
+                }
+                flush() {
+                    const int16 = new Int16Array(512);
+                    for (let j = 0; j < 512; j++) {
+                        const s = Math.max(-1, Math.min(1, this.buffer[j]));
+                        int16[j] = s < 0 ? s * 32768 : s * 32767;
+                    }
+                    this.port.postMessage(int16.buffer, [int16.buffer]);
+                    this.buffer = new Float32Array(512);
+                    this.idx = 0;
+                }
+                process(inputs) {
+                    const input = inputs[0]?.[0];
+                    if (!input) return true;
+                    if (this.ratio <= 1.01) {
+                        for (let i = 0; i < input.length; i++) {
+                            this.buffer[this.idx++] = input[i];
+                            if (this.idx >= 512) this.flush();
+                        }
+                    } else {
+                        // Linear interpolation resampler (reduces aliasing vs sample-skip)
+                        for (let i = 0; i < input.length; i++) {
+                            this.resamplePos += 16000;
+                            if (this.resamplePos >= sampleRate) {
+                                this.resamplePos -= sampleRate;
+                                const frac = this.resamplePos / sampleRate;
+                                const prev = i > 0 ? input[i - 1] : (this.lastSample || 0);
+                                this.buffer[this.idx++] = prev + frac * (input[i] - prev);
+                                if (this.idx >= 512) this.flush();
+                            }
+                        }
+                        this.lastSample = input[input.length - 1];
+                    }
+                    return true;
+                }
+            }
+            registerProcessor('pcm-processor', PCMProcessor);
+        `;
+
+        async function initMic() {
+            try {
+                status.textContent = 'Requesting mic...';
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true  // Normalize volume for quiet/loud speakers
+                    }
+                });
+                try { audioContext = new AudioContext({ sampleRate: 16000 }); }
+                catch (_) { audioContext = new AudioContext(); }
+                // iOS Safari: AudioContext starts suspended, resume on user gesture
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                // AudioContext ready (sampleRate/state logged in dev only)
+                const blob = new Blob([processorCode], { type: 'application/javascript' });
+                const blobUrl = URL.createObjectURL(blob);
+                await audioContext.audioWorklet.addModule(blobUrl);
+                URL.revokeObjectURL(blobUrl);
+                micReady = true;
+                // Mic stream acquired
+            } catch (err) {
+                console.error('Mic error:', err);
+                status.textContent = 'Mic denied: ' + err.message;
+                throw err;  // Propagate error to startStreaming
+            }
+        }
+
+        function connectAudioWs() {
+            if (!_wsToken) return Promise.reject(new Error('No auth token'));
+            return new Promise((resolve, reject) => {
+                audioWs = new WebSocket('wss://' + location.host + '/ws-audio-stream');
+                audioWs.binaryType = 'arraybuffer';
+                let authResolved = false;
+
+                audioWs.onopen = () => {
+                    const tokenBytes = new TextEncoder().encode(_wsToken);
+                    const authMsg = new Uint8Array(1 + tokenBytes.length);
+                    authMsg[0] = 0xFA;
+                    authMsg.set(tokenBytes, 1);
+                    audioWs.send(authMsg.buffer);
+                    // Audio WS connected
+                };
+
+                audioWs.onmessage = (e) => {
+                    // Resolve on first server message — proves auth succeeded
+                    if (!authResolved) { authResolved = true; resolve(); }
+                    const data = new Uint8Array(e.data);
+                    const type = data[0];
+                    const payload = new TextDecoder().decode(data.slice(1));
+
+                    if (type === MSG_SESSION_READY) {
+                        sessionActive = true;
+                        status.textContent = 'Listening...';
+                        startAudioCapture();
+                    } else if (type === MSG_SESSION_DONE) {
+                        sessionActive = false;
+                        status.textContent = 'Done';
+                        cleanup();
+                    } else if (type === MSG_PARTIAL) {
+                        result.textContent = payload;
+                        result.classList.add('partial');
+                    } else if (type === MSG_FINAL) {
+                        result.textContent = payload;
+                        result.classList.remove('partial');
+                        if (sessionActive) status.textContent = 'Listening...';
+                    } else if (type === MSG_VAD_STATUS) {
+                        if (sessionActive) status.textContent = data[1] === 0x01 ? 'Streaming...' : 'Listening...';
+                    } else if (type === MSG_BACKPRESSURE) {
+                        paused = true;
+                        setTimeout(() => { paused = false; }, 500);
+                    } else if (type === MSG_INPUT_PAUSED) {
+                        if (gyroAutoSwitch && inputMode === 'gyro') switchMode('trackpad');
+                        status.textContent = 'Paused \u2014 laptop input active';
+                        status.classList.add('paused');
+                        status.classList.remove('recording');
+                    } else if (type === MSG_INPUT_RESUMED) {
+                            status.textContent = sessionActive ? 'Listening...' : 'Ready';
+                        status.classList.remove('paused');
+                        if (sessionActive) status.classList.add('recording');
+                    } else if (type === MSG_ERROR) {
+                        status.textContent = 'Error: ' + payload;
+                        console.error('Server error:', payload);
+                    }
+                };
+
+                audioWs.onclose = (e) => {
+                    // Audio WS closed
+                    // Reject promise if closed before auth completed
+                    if (!authResolved) { authResolved = true; reject(new Error('WS closed before auth: ' + e.code)); return; }
+
+                    if (e.code === 4401) {
+                        cleanup();
+                        handleAuthFailure('Audio WS');
+                        return;
+                    }
+
+                    // Auto-reconnect on unexpected disconnection
+                    if (e.code !== 1000 && isStreaming && !isReconnecting && reconnectAttempts < maxReconnectAttempts) {
+                        isReconnecting = true;
+                        const delay = reconnectDelays[reconnectAttempts];
+                        reconnectAttempts++;
+                        status.textContent = `Reconnecting (${reconnectAttempts}/${maxReconnectAttempts})...`;
+                        // Reconnecting audio WS
+
+                        setTimeout(async () => {
+                            try {
+                                await connectAudioWs();
+                                // Reconnected successfully
+                                reconnectAttempts = 0; // Reset on success
+                                isReconnecting = false;
+
+                                // Resume streaming if still in streaming mode
+                                if (isStreaming && audioWs?.readyState === WebSocket.OPEN) {
+                                    audioWs.send(new Uint8Array([MSG_START_SESSION]));
+                                }
+                            } catch (err) {
+                                console.error('Reconnection failed:', err);
+                                isReconnecting = false;
+
+                                if (reconnectAttempts >= maxReconnectAttempts) {
+                                    status.textContent = 'Connection lost - please refresh';
+                                    cleanup();
+                                }
+                            }
+                        }, delay);
+                    } else if (e.code !== 1000 && isStreaming) {
+                        status.textContent = 'Disconnected';
+                        cleanup();
+                    }
+                };
+
+                audioWs.onerror = (err) => {
+                    console.error('Audio WS error:', err);
+                    reject(err);
+                };
+            });
+        }
+
+        function startAudioCapture() {
+            if (audioContext.state === 'suspended') audioContext.resume();
+
+            // Disconnect old nodes to prevent duplicate audio pipelines on reconnect
+            if (workletNode) { try { workletNode.disconnect(); } catch(_) {} workletNode = null; }
+            if (sourceNode) { try { sourceNode.disconnect(); } catch(_) {} sourceNode = null; }
+
+            workletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+            workletNode.port.onmessage = (e) => {
+                if (!sessionActive || paused || isMuted) return;
+                if (audioWs?.readyState === WebSocket.OPEN) {
+                    const frame = new Uint8Array(1 + e.data.byteLength);
+                    frame[0] = MSG_AUDIO_FRAME;
+                    frame.set(new Uint8Array(e.data), 1);
+                    audioWs.send(frame);
+                }
+            };
+
+            sourceNode = audioContext.createMediaStreamSource(mediaStream);
+            sourceNode.connect(workletNode);
+        }
+
+        async function startStreaming() {
+            if (isStreaming) return;
+            isStreaming = true;
+            result.textContent = '';
+
+            try {
+                // Request mic access only when starting recording
+                if (!mediaStream) {
+                    status.textContent = 'Requesting mic...';
+                    await initMic();
+                }
+
+                await connectAudioWs();
+                audioWs.send(new Uint8Array([MSG_START_SESSION]));
+                status.textContent = 'Starting...';
+                status.classList.add('recording');
+
+            } catch (err) {
+                if (!_wsToken) {
+                    _showAuthLostUI();
+                } else {
+                    status.textContent = 'Connection failed';
+                }
+                isStreaming = false;
+                setMicState('idle');
+            }
+        }
+
+        function stopStreaming() {
+            if (!isStreaming) return;
+
+            if (audioWs?.readyState === WebSocket.OPEN && sessionActive) {
+                status.textContent = 'Processing...';
+                audioWs.send(new Uint8Array([MSG_END_SESSION]));
+                // DO NOT close here - wait for SESSION_DONE
+            } else {
+                cleanup();
+            }
+        }
+
+        function cleanup() {
+            isStreaming = false;
+            sessionActive = false;
+
+            if (workletNode) { workletNode.disconnect(); workletNode = null; }
+            if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
+            if (audioWs) { audioWs.close(); audioWs = null; }
+
+            // Release mic - stops the indicator on phone
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+                micReady = false;
+                // Mic released
+            }
+
+            if (audioContext && audioContext.state !== 'closed') {
+                audioContext.close();
+                audioContext = null;
+            }
+
+            setMicState('idle');
+            status.textContent = 'Ready';
+            status.classList.remove('recording');
+        }
+
+        // ===== MIC BUTTON — Unified gesture handler =====
+        function cancelLongPress() {
+            if (micLongPressTimer) { clearTimeout(micLongPressTimer); micLongPressTimer = null; }
+        }
+
+        micBtn.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            if (micState === 'processing') return;
+            if (micState === 'locked') {
+                haptic();
+                stopStreaming();
+                setMicState('processing');
+                status.textContent = 'Processing...';
+                status.classList.remove('recording');
+                return;
+            }
+            if (micState === 'idle') {
+                const touch = e.changedTouches[0];
+                micTouchStartX = touch.clientX;
+                micTouchStartY = touch.clientY;
+                micTouchId = touch.identifier;
+                setMicState('waiting');
+                micLongPressTimer = setTimeout(async () => {
+                    micLongPressTimer = null;
+                    haptic();
+                    setMicState('holding');
+                    result.textContent = '';
+                    status.classList.add('recording');
+                    await startStreaming();
+                }, MIC_LONG_PRESS_MS);
+            }
+        }, { passive: false });
+
+        micBtn.addEventListener('touchmove', (e) => {
+            if (micState !== 'holding' && micState !== 'waiting') return;
+            const touch = Array.from(e.changedTouches).find(t => t.identifier === micTouchId);
+            if (!touch) return;
+            const deltaX = micTouchStartX - touch.clientX;
+            const deltaY = micTouchStartY - touch.clientY;
+            if (micState === 'waiting' && (Math.abs(deltaX) > 20 || Math.abs(deltaY) > 20)) {
+                cancelLongPress();
+                setMicState('idle');
+                return;
+            }
+            if (micState === 'holding' && deltaX > DRAG_LEFT_PX) {
+                haptic();
+                setMicState('locked');
+                micTouchId = null;
+            }
+        }, { passive: false });
+
+        micBtn.addEventListener('touchend', (e) => {
+            const touch = Array.from(e.changedTouches).find(t => t.identifier === micTouchId);
+            if (micState === 'waiting') {
+                cancelLongPress();
+                setMicState('idle');
+                return;
+            }
+            if (micState === 'holding' && touch) {
+                stopStreaming();
+                setMicState('processing');
+                status.textContent = 'Processing...';
+                status.classList.remove('recording');
+                micTouchId = null;
+                return;
+            }
+        }, { passive: false });
+
+        micBtn.addEventListener('touchcancel', () => {
+            cancelLongPress();
+            if (micState === 'waiting') {
+                setMicState('idle');
+            } else if (micState === 'holding') {
+                stopStreaming();
+                setMicState('processing');
+                status.textContent = 'Processing...';
+                status.classList.remove('recording');
+            }
+            micTouchId = null;
+        });
+
+        // Mouse fallback for desktop testing
+        let mouseIsDown = false;
+        micBtn.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            if (micState === 'processing') return;
+            if (micState === 'locked') {
+                haptic();
+                stopStreaming();
+                setMicState('processing');
+                status.textContent = 'Processing...';
+                status.classList.remove('recording');
+                return;
+            }
+            if (micState === 'idle') {
+                mouseIsDown = true;
+                micTouchStartX = e.clientX;
+                micTouchStartY = e.clientY;
+                setMicState('waiting');
+                micLongPressTimer = setTimeout(async () => {
+                    micLongPressTimer = null;
+                    if (!mouseIsDown) return;
+                    haptic();
+                    setMicState('holding');
+                    result.textContent = '';
+                    status.classList.add('recording');
+                    await startStreaming();
+                }, MIC_LONG_PRESS_MS);
+            }
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!mouseIsDown || micState !== 'holding') return;
+            const deltaX = micTouchStartX - e.clientX;
+            if (deltaX > DRAG_LEFT_PX) {
+                haptic();
+                setMicState('locked');
+                mouseIsDown = false;
+            }
+        });
+        document.addEventListener('mouseup', () => {
+            if (!mouseIsDown) return;
+            mouseIsDown = false;
+            if (micState === 'waiting') {
+                cancelLongPress();
+                setMicState('idle');
+            } else if (micState === 'holding') {
+                stopStreaming();
+                setMicState('processing');
+                status.textContent = 'Processing...';
+                status.classList.remove('recording');
+            }
+        });
+
+        // A19-P2-11: Use addEventListener (consistent with other buttons, not overwritable)
+        muteBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            haptic();
+            isMuted = !isMuted;
+            muteBtn.classList.toggle('muted', isMuted);
+            // Bounce animation
+            muteBtn.classList.remove('mute-anim');
+            void muteBtn.offsetWidth; // reflow trigger for re-animation
+            muteBtn.classList.add('mute-anim');
+            if (sessionActive) status.textContent = isMuted ? 'Muted' : 'Listening...';
+
+            // Actually disable/enable mic track
+            if (mediaStream) {
+                mediaStream.getAudioTracks().forEach(track => {
+                    track.enabled = !isMuted;
+                });
+            }
+        });
+        muteBtn.addEventListener('animationend', () => muteBtn.classList.remove('mute-anim'));
+
+        // ===== MOBILE LIFECYCLE MANAGEMENT =====
+
+        // Handle background tab - suspend/resume AudioContext on iOS
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                // Tab went to background
+                if (audioContext && audioContext.state === 'running') {
+                    audioContext.suspend().then(() => {
+                        // AudioContext suspended
+                    });
+                }
+            } else {
+                // Tab came to foreground — reconnect trackpad WS if dead
+                connectTrackpad();
+                if (audioContext) {
+                    if (audioContext.state === 'suspended') {
+                        audioContext.resume().then(() => {
+                            // AudioContext resumed
+                        }).catch(() => {
+                            // iOS may have killed the context entirely — need user gesture to recreate
+                            console.warn('AudioContext resume failed — will recreate on next mic press');
+                            audioContext = null;
+                            micReady = false;
+                        });
+                    } else if (audioContext.state === 'closed') {
+                        // iOS killed the context — mark for recreation
+                        console.warn('AudioContext was closed (iOS background kill)');
+                        audioContext = null;
+                        micReady = false;
+                    }
+                }
+            }
+        });
+
+        // Handle network status - show offline/online feedback
+        window.addEventListener('offline', () => {
+            // Network offline
+            status.textContent = 'Offline - check connection';
+            // Don't cleanup, allow reconnection when back online
+        });
+
+        window.addEventListener('online', () => {
+            // Network online
+            // Reconnect trackpad WS immediately
+            connectTrackpad();
+            if (isStreaming && (!audioWs || audioWs.readyState !== WebSocket.OPEN)) {
+                status.textContent = 'Reconnecting...';
+                // Trigger reconnection attempt
+                reconnectAttempts = 0;
+                isReconnecting = false;
+            } else {
+                status.textContent = 'Ready';
+            }
+        });
+
+        // A19-P3-6: Removed console.log of audio constraints (leaked browser capabilities in production)
+
+        // ===== SCREEN MIRROR =====
+        const screenBtn = document.getElementById('screenBtn');
+        const screenOverlay = document.getElementById('screenOverlay');
+        const screenBackBtn = document.getElementById('screenBackBtn');
+        const screenFpsEl = document.getElementById('screenFps');
+        const screenCtx = screenCanvas ? screenCanvas.getContext('2d') : null;
+        const screenResEl = document.getElementById('screenRes');
+        if (screenResEl) screenResEl.value = localStorage.getItem('screenRes') || '1080p';
+        // A19-P1-2: Resolution change during active mirror — reconnect with new setting
+        if (screenResEl) screenResEl.addEventListener('change', () => {
+            localStorage.setItem('screenRes', screenResEl.value);
+            if (screenActive) { stopScreenMirror(); setTimeout(startScreenMirror, 500); }
+        });
+        let screenWs = null;
+        let videoDecoder = null;
+        let screenActive = false;
+        let screenFrameCount = 0;
+        let screenFpsTimer = null;
+
+        function startScreenMirror() {
+            if (screenActive) return;
+            if (!_wsToken) { _showAuthLostUI(); return; }
+            if (typeof VideoDecoder === 'undefined') {
+                alert('WebCodecs not supported in this browser');
+                return;
+            }
+            screenActive = true;
+            screenOverlay.classList.add('active');
+
+            videoDecoder = new VideoDecoder({
+                output: (frame) => {
+                    screenCanvas.width = frame.displayWidth;
+                    screenCanvas.height = frame.displayHeight;
+                    screenCtx.drawImage(frame, 0, 0);
+                    frame.close();
+                    screenFrameCount++;
+                },
+                error: (e) => {
+                    console.error('VideoDecoder error:', e);
+                    // Attempt recovery: close broken decoder and reset config state
+                    // so it will be re-created on next keyframe
+                    try { videoDecoder.close(); } catch(_) {}
+                    configured = false;
+                    videoDecoder = new VideoDecoder({
+                        output: (frame) => {
+                            screenCanvas.width = frame.displayWidth;
+                            screenCanvas.height = frame.displayHeight;
+                            screenCtx.drawImage(frame, 0, 0);
+                            frame.close();
+                            screenFrameCount++;
+                        },
+                        error: (e2) => { console.error('VideoDecoder error after recovery:', e2); }
+                    });
+                }
+            });
+
+            const resSelect = document.getElementById('screenRes');
+            const resParam = resSelect ? resSelect.value : '';
+            let screenUrl = 'wss://' + location.host + '/ws-screen';
+            if (resParam) screenUrl += '?res=' + resParam;
+            if (resSelect) localStorage.setItem('screenRes', resSelect.value);
+            screenWs = new WebSocket(screenUrl);
+            screenWs.binaryType = 'arraybuffer';
+
+            screenWs.onopen = () => {
+                // Send MSG_AUTH (0xFA + token)
+                const tokenBytes = new TextEncoder().encode(_wsToken);
+                const authMsg = new Uint8Array(1 + tokenBytes.length);
+                authMsg[0] = 0xFA;
+                authMsg.set(tokenBytes, 1);
+                screenWs.send(authMsg.buffer);
+            };
+
+            let configured = false;
+
+            screenWs.onmessage = (e) => {
+                const data = new Uint8Array(e.data);
+                if (data[0] === 0x20) {
+                    // SCREEN_CONFIG: [0x20][width:2LE][height:2LE][fps:1]
+                    const dv = new DataView(e.data);
+                    const w = dv.getUint16(1, true);
+                    const h = dv.getUint16(3, true);
+                    // Screen config received
+                    return;
+                }
+
+                // Frame: [flags:1][timestamp:4LE][h264_data:N]
+                const flags = data[0];
+                const isKey = !!(flags & 0x01);
+                const timestamp = new DataView(e.data).getUint32(1, true);
+                const h264Data = new Uint8Array(e.data, 5);
+
+                if (!configured && isKey) {
+                    // Configure decoder on first keyframe
+                    // Extract codec string from SPS NAL
+                    let codecStr = 'avc1.42001e'; // baseline profile level 3.0 default
+                    // A19-P3-7: Find SPS in data — check both 3-byte (00 00 01) and 4-byte (00 00 00 01) start codes
+                    for (let i = 0; i < h264Data.length - 5; i++) {
+                        let nalStart = -1;
+                        if (h264Data[i] === 0 && h264Data[i+1] === 0) {
+                            if (h264Data[i+2] === 1) { nalStart = i + 3; }           // 3-byte
+                            else if (h264Data[i+2] === 0 && h264Data[i+3] === 1) { nalStart = i + 4; } // 4-byte
+                        }
+                        if (nalStart > 0 && nalStart + 3 < h264Data.length) {
+                            const nalType = h264Data[nalStart] & 0x1F;
+                            if (nalType === 7) {
+                                // SPS found: profile_idc, constraint_flags, level_idc
+                                const profile = h264Data[nalStart+1].toString(16).padStart(2, '0');
+                                const compat = h264Data[nalStart+2].toString(16).padStart(2, '0');
+                                const level = h264Data[nalStart+3].toString(16).padStart(2, '0');
+                                codecStr = `avc1.${profile}${compat}${level}`;
+                                break;
+                            }
+                        }
+                    }
+                    try {
+                        videoDecoder.configure({
+                            codec: codecStr,
+                            optimizeForLatency: true,
+                        });
+                        configured = true;
+                        // VideoDecoder configured
+                    } catch (err) {
+                        console.error('Failed to configure decoder:', err);
+                        return;
+                    }
+                }
+
+                if (!configured) return; // Wait for first keyframe
+
+                try {
+                    videoDecoder.decode(new EncodedVideoChunk({
+                        type: isKey ? 'key' : 'delta',
+                        timestamp: timestamp * 1000, // microseconds
+                        data: h264Data,
+                    }));
+                } catch (err) {
+                    console.error('Decode error:', err);
+                }
+            };
+
+            screenWs.onclose = (e) => {
+                const wasActive = screenActive;
+                // Screen WS closed
+                if (e?.code === 4401) {
+                    stopScreenMirror();
+                    handleAuthFailure('Screen WS');
+                    return;
+                }
+                stopScreenMirror();
+                // Auto-reconnect on unexpected close while screen mode was active
+                if (wasActive && e?.code !== 1000) {
+                    // Screen WS auto-reconnecting
+                    setTimeout(() => { startScreenMirror(); }, 2000);
+                }
+            };
+            screenWs.onerror = () => { console.error('Screen WS error'); };
+
+            // FPS counter
+            screenFrameCount = 0;
+            screenFpsTimer = setInterval(() => {
+                screenFpsEl.textContent = screenFrameCount + ' fps';
+                screenFrameCount = 0;
+            }, 1000);
+        }
+
+        function stopScreenMirror() {
+            screenActive = false;
+            screenOverlay.classList.remove('active');
+            if (screenWs && screenWs.readyState === WebSocket.OPEN) {
+                screenWs.close(1000);
+            }
+            screenWs = null;
+            if (videoDecoder && videoDecoder.state !== 'closed') {
+                try { videoDecoder.close(); } catch(e) {}
+            }
+            videoDecoder = null;
+            if (screenFpsTimer) {
+                clearInterval(screenFpsTimer);
+                screenFpsTimer = null;
+            }
+            screenFpsEl.textContent = '--';
+        }
+
+        // Use touchstart with preventDefault to eliminate 300ms tap delay on mobile
+        screenBtn.addEventListener('touchstart', (e) => { e.preventDefault(); haptic(); startScreenMirror(); }, {passive: false});
+        screenBtn.addEventListener('click', () => { haptic(); startScreenMirror(); }); // Desktop fallback
+        screenBackBtn.addEventListener('touchstart', (e) => { e.preventDefault(); haptic(); stopScreenMirror(); }, {passive: false});
+        screenBackBtn.addEventListener('click', () => { haptic(); stopScreenMirror(); }); // Desktop fallback
+
+        // Init - don't request mic until user starts recording
+        status.textContent = 'Ready';
+    </script>
+</body>
+</html>

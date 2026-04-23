@@ -49,10 +49,11 @@ import queue
 import hashlib
 import json
 import signal
+import uuid
 from enum import Enum, auto
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import HTMLResponse, Response, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form, Path as PathParam
+from fastapi.responses import HTMLResponse, Response, JSONResponse, PlainTextResponse
 from fastapi import Request
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.websockets import WebSocketState
@@ -66,17 +67,65 @@ import secrets
 import qrcode
 import qrcode.image.svg
 
-# Auth token for WebSocket connections (generated at startup)
-AUTH_TOKEN = secrets.token_urlsafe(24)
+# Auth token for WebSocket connections (persisted across restarts)
+AUTH_TOKEN = secrets.token_urlsafe(24)  # default; overwritten by _load_auth_token() at startup
 
 _paired_ips: set[str] = set()  # IPs that have paired (for logging)
 _pair_attempts: dict[str, list[float]] = {}  # IP -> list of timestamps (rate limiting)
-_PAIR_RATE_LIMIT = 5   # max attempts per window
-_PAIR_RATE_WINDOW = 60  # seconds
+# Auth/rate-limit constants live in auth_core.py — single source for both
+# server (here) and tests (tests/test_auth_logic.py). Re-exported as the
+# old _-prefixed names for backward compat with all the inline references.
+from auth_core import (
+    PAIR_RATE_LIMIT as _PAIR_RATE_LIMIT,
+    PAIR_RATE_WINDOW as _PAIR_RATE_WINDOW,
+)
 _pair_locked = False  # True after first successful pair — blocks further pairing
+# P0-4: TOFU pair code — generated at startup, required in /api/pair body to prevent
+# first-pair race on shared WiFi. 4-digit numeric code displayed in server console.
+_pair_code: str = f"{secrets.randbelow(10000):04d}"
 _blink_active = False
 SERVER_PORT = 5000  # updated at startup from args
 _SERVICE_MODE = False  # Set True by --service flag
+_SERVER_START_TIME = time.time()  # For uptime in /api/health
+
+def _read_version() -> str:
+    """Read version from top-level VERSION file (single source of truth for Android + server)."""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = os.path.dirname(script_dir)
+        with open(os.path.join(root_dir, "VERSION"), "r") as f:
+            return f.read().strip() or "0.0.0"
+    except Exception:
+        return "0.0.0"
+
+_SERVER_VERSION = _read_version()
+
+# Active WS connection counters (atomically updated)
+_active_trackpad_ws = 0
+_active_screen_ws = 0
+_active_audio_out_ws = 0
+
+# Dashboard push channel — real-time transcripts to /dashboard clients.
+# Set of WebSocket instances accepted on /ws-dashboard. Mutated only from the
+# asyncio loop, so no lock needed. Broadcasts are best-effort: a dead socket
+# is popped on the next send.
+_dashboard_ws_clients: "set[WebSocket]" = set()
+# Cap number of concurrent dashboards at 8 — more than one physical user per LAN
+# is exotic; this stops a misconfigured client from leaking sockets.
+_MAX_DASHBOARD_WS = 8
+
+# Audio reconnection buffer: per-(IP, session_token_hash) ring buffer of
+# recent audio frames. On reconnect, replay buffered frames so no speech
+# is lost during WS drop.
+# 3 seconds at 31.25 fps = ~94 frames × 1024 bytes = ~96KB per client (negligible).
+#
+# O-P1-2 / F-Apr22-02: keyed by (client_ip, session_token_hash) where the
+# hash is sha256(token)[:16]. Previously keyed by IP alone, which meant two
+# phones behind the same NAT could share — and cross-feed — each other's
+# buffered audio on reconnect. Multi-phone is still blocked server-side by
+# code 4030, so this is defensive hardening for when the cap is lifted.
+_audio_reconnect_buffers: "dict[tuple[str, str], deque]" = {}
+_RECONNECT_BUFFER_MAX_FRAMES = 94  # ~3 seconds of audio
 
 # Server state machine (service mode)
 class ServerState(Enum):
@@ -95,11 +144,13 @@ _MODEL_UNLOAD_TIMEOUT = 900  # 15 minutes no WS connections
 # Per-client session management
 _client_sessions: dict[str, dict] = {}  # token -> {ip, created, last_used}
 _auth_attempts: dict[str, list[float]] = {}  # IP -> timestamps
-_AUTH_RATE_LIMIT = 3   # max failed attempts per window
-_AUTH_RATE_WINDOW = 60  # seconds
-_AUTH_LOCKOUT = 600  # 10 minute lockout after exceeding rate limit
+from auth_core import (
+    AUTH_RATE_LIMIT as _AUTH_RATE_LIMIT,
+    AUTH_RATE_WINDOW as _AUTH_RATE_WINDOW,
+    AUTH_LOCKOUT as _AUTH_LOCKOUT,
+    SESSION_TTL as _SESSION_TTL,
+)
 _SESSION_MAX_COUNT = 50        # Max concurrent sessions
-_SESSION_TTL = 30 * 24 * 3600  # 30 days in seconds
 
 # Config file for service mode
 _CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "sanketra")
@@ -124,11 +175,16 @@ def _load_config():
     return {}
 
 def _save_config(config):
-    """Save config to ~/.config/sanketra/config.json.
-    Caller MUST hold _config_lock when part of a read-modify-write."""
+    """Save config to ~/.config/sanketra/config.json (atomic).
+    Caller MUST hold _config_lock when part of a read-modify-write.
+    Write to temp file, fsync, then os.replace — crash-safe."""
     os.makedirs(_CONFIG_DIR, exist_ok=True)
-    with open(_CONFIG_FILE, "w") as f:
+    tmp_path = _CONFIG_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(config, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, _CONFIG_FILE)
 
 def _get_app_password_hash():
     """Get stored Argon2id password hash from config"""
@@ -144,12 +200,117 @@ def _set_app_password_hash(password_hash):
         _save_config(config)
 
 def _save_client_sessions():
-    """Persist client sessions to config.
-    Caller MUST hold _sessions_lock."""
+    """Persist client sessions to config (synchronous write — blocks fsync).
+    Caller MUST hold _sessions_lock.
+
+    Hot-path callers should prefer _mark_sessions_dirty() instead, which
+    schedules a coalesced write via the background writer task. This sync
+    function is still used by the shutdown flush and the initial bootstrap
+    path where we want a guaranteed-durable write before returning."""
     with _config_lock:
         config = _load_config()
         config["sessions"] = dict(_client_sessions)
         _save_config(config)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Debounced session writer (O-P1-4 / F-Apr22-03)
+#
+# Problem: every WS auth and /api/auth call was writing ~ /.config/sanketra/
+# config.json (with fsync + os.replace) inline. Under concurrent phone auth
+# bursts the fsync cost stacks up and blocks the asyncio loop long enough to
+# drop audio frames. Single-user LAN usage hid it; multi-device hardening
+# and a future "refresh all tokens" admin action would not.
+#
+# Design: one long-lived writer task. Mutators call _mark_sessions_dirty()
+# which sets an asyncio.Event. The writer wakes, sleeps 500 ms (coalesce
+# window — any further mutations in that window collapse into the same
+# fsync), snapshots _client_sessions under _sessions_lock, and writes once.
+#
+# Durability contract: every mutation is guaranteed a write within
+# ~500 ms + fsync time. A crash in that window loses the tail edit — same
+# order of magnitude as the OS page-cache flush interval, and far better
+# than the prior "fsync per auth or lose the WS frame budget" tradeoff.
+# Shutdown path flushes synchronously via _drain_sessions_writer() so a
+# clean stop still persists everything.
+_sessions_dirty: "asyncio.Event | None" = None
+_sessions_writer_task: "asyncio.Task | None" = None
+_sessions_writer_loop: "asyncio.AbstractEventLoop | None" = None
+_SESSIONS_COALESCE_SECONDS = 0.5
+
+
+def _mark_sessions_dirty():
+    """Signal the background writer that _client_sessions changed.
+    Safe to call from asyncio handlers or sync threads (e.g. ThreadPool).
+    No-op if the writer isn't started yet (bootstrap / test import)."""
+    evt = _sessions_dirty
+    loop = _sessions_writer_loop
+    if evt is None or loop is None:
+        return
+    # asyncio.Event.set() is not threadsafe — schedule it on the writer's loop.
+    try:
+        loop.call_soon_threadsafe(evt.set)
+    except RuntimeError:
+        # Loop closed (shutdown race) — fall through silently. The shutdown
+        # path has already drained, or will drain synchronously below.
+        pass
+
+
+async def _sessions_writer_main():
+    """Coalescing writer: wake on dirty, sleep the coalesce window, write once."""
+    global _sessions_dirty
+    assert _sessions_dirty is not None
+    while True:
+        await _sessions_dirty.wait()
+        # Coalesce: any mutations during this sleep pile into the same write.
+        await asyncio.sleep(_SESSIONS_COALESCE_SECONDS)
+        _sessions_dirty.clear()
+        try:
+            # Snapshot under the threading lock so we never observe a half-
+            # mutated dict from /api/auth's purge-evict-insert sequence.
+            with _sessions_lock:
+                snapshot = dict(_client_sessions)
+            with _config_lock:
+                config = _load_config()
+                config["sessions"] = snapshot
+                _save_config(config)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Write errors must NOT kill the writer — next mutation will
+            # re-trigger, next disk free / permission fix will heal.
+            logging.warning(f"[Sessions] debounced write failed: {e}")
+
+
+def _start_sessions_writer():
+    """Spawn the writer task. Called once from lifespan startup."""
+    global _sessions_dirty, _sessions_writer_task, _sessions_writer_loop
+    if _sessions_writer_task is not None:
+        return
+    _sessions_writer_loop = asyncio.get_running_loop()
+    _sessions_dirty = asyncio.Event()
+    _sessions_writer_task = asyncio.create_task(_sessions_writer_main())
+    _sessions_writer_task.add_done_callback(_task_done)
+
+
+async def _drain_sessions_writer():
+    """Shutdown path: flush any pending mutations from the last ~500 ms,
+    then cancel the writer. Unconditional write — cheaper than poking the
+    Event flag across the threading/asyncio boundary, and config.json is
+    small enough that one extra write at shutdown is invisible."""
+    global _sessions_writer_task
+    try:
+        with _sessions_lock:
+            _save_client_sessions()
+    except Exception as e:
+        logging.warning(f"[Sessions] shutdown flush failed: {e}")
+    if _sessions_writer_task is not None:
+        _sessions_writer_task.cancel()
+        try:
+            await _sessions_writer_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _sessions_writer_task = None
 
 def _load_client_sessions():
     """Load persisted client sessions"""
@@ -159,12 +320,39 @@ def _load_client_sessions():
             config = _load_config()
             _client_sessions = config.get("sessions", {})
 
+def _load_auth_token():
+    """Load persisted AUTH_TOKEN from config, or generate + save a new one.
+    Ensures token survives server restarts so web clients don't lose auth."""
+    global AUTH_TOKEN
+    with _config_lock:
+        config = _load_config()
+        saved = config.get("auth_token", "")
+        if saved:
+            AUTH_TOKEN = saved
+        else:
+            # First run or config wiped — persist the token generated at import time
+            config["auth_token"] = AUTH_TOKEN
+            _save_config(config)
+
 def _load_pair_lock():
     """Load pair lock state from config on startup."""
     global _pair_locked
     with _config_lock:
         config = _load_config()
         _pair_locked = config.get("pair_locked", False)
+
+def _load_pair_code():
+    """Load a pre-provisioned pair code from config.json (written by SSH setup).
+    If config contains a valid 4-digit pair_code string, use it and delete from config."""
+    global _pair_code
+    with _config_lock:
+        config = _load_config()
+        code = config.get("pair_code")
+        if isinstance(code, str) and len(code) == 4 and code.isdigit():
+            _pair_code = code
+            del config["pair_code"]
+            _save_config(config)
+            log_info(f"Loaded pre-provisioned pair code from config")
 
 def _get_server_id():
     """Get or generate a persistent server identity.
@@ -194,7 +382,7 @@ def _set_pair_lock(locked: bool, device_ip: str = None):
         elif not locked:
             config.pop("paired_device", None)
         _save_config(config)
-    _pair_locked = locked
+        _pair_locked = locked
 
 from stt_common import (
     load_whisper, load_vad, to_roman, select_model, init_gpu, get_gpu_stats, cleanup_gpu,
@@ -205,10 +393,16 @@ from stt_common import (
     custom_model_selection, get_vad_type, get_available_models,
     get_display_server, get_linux_input_tool, get_input_tool_info, PLATFORM,
     preprocess_audio_frame, preprocess_audio_buffer, get_preprocessing_config, FilterState,
-    pause_app_input, resume_app_input, is_app_input_paused, register_pause_callback
+    pause_app_input, resume_app_input, is_app_input_paused, register_pause_callback,
+    get_cursor_position, get_monitors, get_monitor_by_index,
 )
 import preflight
 import input_monitor
+import auth_core
+import history_db
+import vocab_store
+import accent_store
+import license_core  # License verifier + installer (offline, no network).
 
 # =============================================================================
 #                              PROTOCOL CONSTANTS
@@ -253,6 +447,95 @@ MAX_SPEECH_FRAMES = int(MAX_SPEECH_SECONDS * SAMPLE_RATE / FRAME_SAMPLES)
 HEARTBEAT_INTERVAL = 15  # seconds
 
 # =============================================================================
+#                          LICENSE FEATURE GATES
+# =============================================================================
+#
+# Free vs Pro enforcement lives on the PC server — neither client binary
+# embeds any checkout surface (see MONETIZATION.md). Knobs are local
+# constants so ops can tweak without a code change elsewhere:
+#
+#   FREE_TIER_MODELS             — Whisper model names a free-tier caller
+#                                  may load. Everything not in this set
+#                                  requires a license that covers the
+#                                  caller's track.
+#   FREE_TIER_MONTHLY_MINUTES    — rolling monthly STT inference cap for
+#                                  free-tier callers. Resets on the first
+#                                  WS auth of a new calendar month (UTC).
+#   VALID_CLIENT_KINDS           — allow-list for the `X-Client-Kind` request
+#                                  header. Unknown values are rejected at the
+#                                  endpoint (400) rather than silently
+#                                  defaulted — don't trust arbitrary strings.
+#   DEFAULT_CLIENT_KIND          — what we assume when the header is missing.
+#                                  `web` because the local browser UI is the
+#                                  only client that legitimately omits it.
+#
+FREE_TIER_MODELS = frozenset({"tiny", "base", "small"})
+FREE_TIER_MONTHLY_MINUTES = 200
+VALID_CLIENT_KINDS = frozenset({"android", "desktop", "web"})
+DEFAULT_CLIENT_KIND = "web"
+
+
+def _now() -> float:
+    """Clock seam for tests. Production code must use this rather than
+    `time.time()` directly so `tests/test_feature_gates.py` can pin a
+    deterministic clock (monkeypatched to return a fixed epoch)."""
+    return time.time()
+
+
+def _client_kind_from_headers(headers) -> "str | None":
+    """Read + validate the `X-Client-Kind` header.
+
+    Returns one of `VALID_CLIENT_KINDS`, or `DEFAULT_CLIENT_KIND` when the
+    header is missing, or `None` when the header is present but outside the
+    allow-list. Callers translate `None` to a 400.
+
+    Accepts FastAPI `Request.headers` (starlette Headers) OR a plain dict
+    so WS handlers that carry `ws.headers` can use the same function.
+    """
+    raw = headers.get("x-client-kind") if hasattr(headers, "get") else None
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return DEFAULT_CLIENT_KIND
+    if not isinstance(raw, str):
+        return None
+    v = raw.strip().lower()
+    if v not in VALID_CLIENT_KINDS:
+        return None
+    return v
+
+
+def _track_for_client_kind(client_kind: str) -> "str | None":
+    """Map client kind → license track whose claim unlocks it.
+
+    `android`  -> `phone`   (a phone-track license OR a bundle license unlocks)
+    `desktop`  -> `desktop` (a desktop-track license OR a bundle license unlocks)
+    `web`      -> None      (browser client is always free tier — no native
+                             binary to sell, per MONETIZATION.md)
+    anything else -> None (defense: unknown → can't unlock anything)
+    """
+    if client_kind == "android":
+        return "phone"
+    if client_kind == "desktop":
+        return "desktop"
+    return None
+
+
+def _has_license_for_client(client_kind: str) -> bool:
+    """Is the currently-installed license sufficient for `client_kind`?
+
+    Delegates to `license_core.has_track()`. Returns False when no license
+    is installed, when the license doesn't cover this track, or when the
+    client kind is one we never unlock (e.g. `web`). Never raises — the
+    license subsystem is designed to fail into "free tier" on any error."""
+    track = _track_for_client_kind(client_kind)
+    if track is None:
+        return False
+    try:
+        return license_core.has_track(track)
+    except Exception as e:
+        log_warning(f"[License] has_track({track}) errored — treating as free tier: {e}")
+        return False
+
+# =============================================================================
 #                              GLOBAL STATE
 # =============================================================================
 
@@ -263,6 +546,22 @@ vad_utils = None
 executor: Optional[ThreadPoolExecutor] = None      # Whisper inference
 io_executor: Optional[ThreadPoolExecutor] = None    # type_text, blink, etc.
 _model_load_executor: Optional[ThreadPoolExecutor] = None  # Model download/load (separate from transcription)
+
+# --- async serialization (single uvicorn worker) ---
+# asyncio.Lock for check-then-act in async handlers. Without these, concurrent
+# POSTs race past the _server_state/_pair_locked bool check and both proceed —
+# causing double-load OOM (two Whisper loads in parallel) and pair-lock bypass
+# (two simultaneous /api/pair both "win"). Single-worker uvicorn makes one
+# event-loop lock per invariant sufficient.
+_model_load_lock: Optional[asyncio.Lock] = None   # created in lifespan
+_pair_mutex: Optional[asyncio.Lock] = None         # created in lifespan
+
+# --- cross-thread state guard ---
+# _loaded_device is mutated from the model-load ThreadPoolExecutor and read
+# from async /api/health + /api/model/status handlers. Reads across threads
+# without a lock can see half-written strings on 32-bit arches; trivially
+# safe here but spells "surprising bug" in 6 months.
+_device_lock = threading.Lock()
 
 # Lock for _client_sessions dict — accessed from asyncio handlers and ThreadPoolExecutor
 _sessions_lock = threading.Lock()
@@ -294,6 +593,15 @@ class StreamingSession:
     _input_health_warned: bool = False
     # AU-P0-1: Rolling byte buffer for variable-length resampled frames
     _raw_byte_buf: bytearray = field(default_factory=bytearray)
+    # Per-session state — never share across connections
+    cached_language: Optional[str] = None  # Detected language, reset per-session
+    _last_drop_log_time: float = 0.0  # Throttle ring-buffer-full warnings to 1/sec
+    # v1.2 history logging: sessions row id in history.db. Populated on
+    # MSG_START_SESSION, cleared on MSG_END_SESSION / disconnect. None when
+    # logging is disabled via the dashboard toggle so the run_inference hook
+    # can skip DB writes entirely.
+    history_session_id: Optional[int] = None
+    client_name: Optional[str] = None  # 'Pixel 8' / 'Chrome on tman' — shown in dashboard
 
     def reset_vad(self):
         """Reset VAD state after transcription"""
@@ -301,14 +609,23 @@ class StreamingSession:
         self.is_speaking = False
         self.had_speech = False
         self.silence_frames = 0
+        # Filter-state leak fix: HPF's biquad memory (`zi`) persisted a transient
+        # from the tail of utterance N into the head of utterance N+1. Reset it so
+        # each utterance starts from silence, not residual high-frequency energy.
+        self.filter_state.zi = None
         if self.vad_iterator:
             self.vad_iterator.reset_states()
 
     def add_audio(self, audio_float: np.ndarray):
         """Add audio frame to buffer (deque auto-trims oldest at maxlen)"""
-        # AU-P0-2: Log warning when ring buffer is full and dropping oldest frames
+        # AU-P0-2: Log warning when ring buffer is full and dropping oldest frames.
+        # Throttled to 1/sec — at 31fps this was 31 log lines/sec of stdio + rotating-file
+        # I/O, which ate another 10-30ms of CPU the system already didn't have.
         if len(self.audio_buffer) == self.audio_buffer.maxlen:
-            log_warning("[Stream] Audio ring buffer full — dropping oldest frame (CPU backpressure)")
+            now = time.time()
+            if now - self._last_drop_log_time >= 1.0:
+                self._last_drop_log_time = now
+                log_warning("[Stream] Audio ring buffer full — dropping oldest frame (CPU backpressure)")
         self.audio_buffer.append(audio_float)
         self.last_activity = time.time()
         self.frames_processed += 1
@@ -332,14 +649,14 @@ def _task_done(t):
 #                              WHISPER INFERENCE (SYNC - runs in thread pool)
 # =============================================================================
 
-_cached_language = None  # Caches detected language to avoid ~200ms re-detection per utterance
-
-def transcribe_sync(audio: np.ndarray) -> tuple:
+def transcribe_sync(audio: np.ndarray, hint_language: Optional[str] = None) -> tuple:
     """
     Synchronous Whisper transcription.
     Runs in thread pool, not in async loop.
+
+    hint_language: previously detected language for this session (saves ~200ms re-detection).
+    Caller should pass `session.cached_language` and store the returned `lang` back.
     """
-    global _cached_language
     with _whisper_lock:
         model = whisper_model  # Snapshot under lock to avoid race with _load_model_async / _unload_model
     if model is None:
@@ -350,15 +667,12 @@ def transcribe_sync(audio: np.ndarray) -> tuple:
     try:
         segments, info = model.transcribe(
             audio,
-            language=_cached_language,
+            language=hint_language,
             vad_filter=False,
             beam_size=1,
             condition_on_previous_text=False,
             initial_prompt="Hindi aur English mein baat ho rahi hai."
         )
-        # Cache detected language for subsequent calls (saves ~200ms)
-        if info.language in ("hi", "en", "ur"):
-            _cached_language = info.language
         text = " ".join([seg.text for seg in segments])
         return text.strip(), info.language
     except Exception as e:
@@ -386,21 +700,45 @@ def _check_any_token(token: str) -> bool:
     # Per-client session token
     return _verify_session(token)
 
-def _check_ws_token(ws: WebSocket) -> bool:
-    """Validate auth token from WebSocket query params."""
-    token = ws.query_params.get('token', '')
-    return _check_any_token(token)
-
-async def _authenticate_ws(ws: WebSocket) -> bool:
-    """Authenticate WS: check query params first, then wait for MSG_AUTH first message.
-    Also enforces max concurrent WS limit."""
-    # Enforce max concurrent WS
-    with _ws_track_lock:
-        if len(_active_audio_ws) >= _MAX_CONCURRENT_WS:
+def _validate_ws_origin(ws: WebSocket) -> bool:
+    """Validate WebSocket Origin header to prevent Cross-Site WebSocket Hijacking (CSWSH).
+    Allows: no Origin (native apps), localhost, and the server's own IP."""
+    origin = ws.headers.get("origin", "")
+    if not origin:
+        return True  # Native apps (Android OkHttp) don't send Origin
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+        host = parsed.hostname or ""
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return True
+        # Allow server's own IP
+        server_ip = get_local_ip()
+        if host == server_ip:
+            return True
+        # Allow any RFC 1918 IP (LAN clients)
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(host)
+            return addr.is_private
+        except ValueError:
             return False
+    except Exception:
+        return True  # Don't block on parse errors
 
-    if _check_ws_token(ws):
-        return True
+async def _authenticate_ws(ws: WebSocket) -> "str | None":
+    """Authenticate WS: check query params first, then wait for MSG_AUTH first message.
+    Concurrent WS limit is enforced atomically in _register_ws() after auth succeeds.
+
+    Returns the validated token string on success, or None on failure. Callers
+    that only need a truthiness check (4 of 5 handlers) can keep using
+    `if not <retval>:` — Python truthiness of a non-empty str is True, of None
+    is False. ws_audio_stream uses the returned token to derive a per-session
+    key for the reconnect-buffer dict (avoids NAT-shared-IP cross-feed risk)."""
+    # Query-param path carries the token in the URL; surface it for callers.
+    query_token = ws.query_params.get('token', '')
+    if query_token and _check_any_token(query_token):
+        return query_token
     # Wait for auth message (binary: [0xFA][utf8_token] or text: {"t":"auth","token":"..."})
     try:
         data = await asyncio.wait_for(ws.receive(), timeout=5.0)
@@ -408,15 +746,17 @@ async def _authenticate_ws(ws: WebSocket) -> bool:
             raw = data['bytes']
             if raw[0] == MSG_AUTH:
                 token = raw[1:].decode('utf-8', errors='ignore')
-                return _check_any_token(token)
+                if _check_any_token(token):
+                    return token
         elif 'text' in data and data['text']:
             msg = json.loads(data['text'])
             if msg.get('t') == 'auth':
                 token = msg.get('token', '')
-                return _check_any_token(token)
+                if _check_any_token(token):
+                    return token
     except Exception as e:
         log_debug(f"[Auth] WS auth message receive failed: {e}")
-    return False
+    return None
 
 async def send_message(ws: WebSocket, msg_type: int, payload: bytes = b""):
     """Send binary message if connection is open"""
@@ -471,15 +811,32 @@ async def run_inference(session: StreamingSession, ws: WebSocket):
 
         loop = asyncio.get_event_loop()
         log_debug(f"[Stream] Transcribing {audio_duration:.2f}s of audio")
-        text, lang = await loop.run_in_executor(executor, transcribe_sync, audio)
+        text, lang = await loop.run_in_executor(executor, transcribe_sync, audio, session.cached_language)
+        # Cache detected language per-session — previously a module global, which
+        # leaked language state between phone A (English) and phone B (Hindi)
+        # sharing the same server instance.
+        if lang in ("hi", "en", "ur"):
+            session.cached_language = lang
 
         if text and lang in ('hi', 'en'):
             text = to_roman(text)
             lang_name = 'Hindi' if lang == 'hi' else 'English'
             result = f"[{lang_name}] {text}"
             await send_message(ws, MSG_FINAL, result.encode('utf-8'))
-            log_info(f"[Stream] Transcribed: {result}")
-            print(result, flush=True)
+            # Codex F-Apr21-10: transcript content used to land in stdout via
+            # log_info(...full text...) + print(result). With v1.2's history
+            # dashboard, that's a privacy double-tap. Log only metadata
+            # (length + language). Set SANKETRA_DEBUG_TRANSCRIPTS=1 to opt
+            # back into full text for debugging.
+            if os.environ.get("SANKETRA_DEBUG_TRANSCRIPTS") == "1":
+                log_info(f"[Stream] Transcribed: {result}")
+                print(result, flush=True)
+            else:
+                log_info(f"[Stream] Transcribed: {len(text)}ch {lang_name}")
+            # v1.2 history: log raw transcript (without the [Hindi]/[English]
+            # prefix) so the dashboard shows clean text. Best-effort — any
+            # DB failure logs and moves on; this MUST NOT kill the WS.
+            _history_log_transcript_safe(session, text, lang)
 
             # Type to cursor (run in executor to not block)
             await loop.run_in_executor(io_executor, type_text, text + ' ')
@@ -494,9 +851,13 @@ async def run_inference(session: StreamingSession, ws: WebSocket):
             log_debug(f"[Stream] Skipped: lang={lang}")
     except Exception as e:
         log_error(f"[Stream] Inference error: {e}")
-        await send_message(ws, MSG_ERROR, str(e).encode('utf-8'))
+        await send_message(ws, MSG_ERROR, b"Transcription failed")
     finally:
         session.pending_inference = False
+        # P0-3: Clear backpressure — client paused mic on MSG_BACKPRESSURE,
+        # now inference is done so tell it to resume via MSG_SESSION_READY
+        # (Android AudioWebSocket already clears _backpressured on this message)
+        await _send_raw(ws, _WIRE_SESSION_READY)
         # AU-P1-5: Preserve audio that arrived during inference (orphan gap fix).
         # Only remove the frames that were part of the transcribed audio.
         new_frames_count = len(session.audio_buffer) - buf_len_at_start
@@ -541,7 +902,9 @@ async def run_partial_inference(session: StreamingSession, ws: WebSocket):
             audio = preprocess_audio_buffer(audio, SAMPLE_RATE, config)
 
         loop = asyncio.get_event_loop()
-        text, lang = await loop.run_in_executor(executor, transcribe_sync, audio)
+        text, lang = await loop.run_in_executor(executor, transcribe_sync, audio, session.cached_language)
+        if lang in ("hi", "en", "ur"):
+            session.cached_language = lang
 
         if text and lang in ('hi', 'en'):
             text = to_roman(text)
@@ -637,53 +1000,261 @@ async def _process_audio_chunk(session: StreamingSession, ws: WebSocket, chunk: 
 #                              WEBSOCKET HANDLER
 # =============================================================================
 
-async def ws_audio_stream(ws: WebSocket):
-    """Main WebSocket handler for audio streaming"""
-    global _last_ws_activity
+def _new_conn_id() -> str:
+    """Generate 8-char hex connection ID for WS correlation logging."""
+    return uuid.uuid4().hex[:8]
+
+def _resolve_cid(ws) -> str:
+    """Use the client-supplied `X-Conn-Id` header if present and sane, else mint one.
+    Lets phone-side logs share a correlation ID with server logs for field debugging."""
+    hdr = ws.headers.get("x-conn-id", "") if hasattr(ws, "headers") else ""
+    if hdr and len(hdr) <= 32 and all(c in "0123456789abcdefABCDEF-" for c in hdr):
+        return hdr[:16]
+    return _new_conn_id()
+
+def _ws_log(conn_id: str, level: str, msg: str):
+    """Log with per-connection correlation ID prefix.
+    level: 'info', 'debug', 'warning', 'error'."""
+    tagged = f"[ws:{conn_id}] {msg}"
+    if level == "info":
+        log_info(tagged)
+    elif level == "debug":
+        log_debug(tagged)
+    elif level == "warning":
+        log_warning(tagged)
+    elif level == "error":
+        log_error(tagged)
+
+
+async def _broadcast_dashboard(event: dict) -> None:
+    """Push a JSON event to all /ws-dashboard clients (best-effort).
+    Dead sockets are swept inline — a stale subscriber can't block live ones.
+    `event` is a JSON-serializable dict; we emit it verbatim with json.dumps so
+    the client sees exactly what the server logged, no schema translation.
+    """
+    if not _dashboard_ws_clients:
+        return
+    try:
+        payload = json.dumps(event, ensure_ascii=False)
+    except (TypeError, ValueError) as e:
+        log_warning(f"[Dashboard] broadcast payload not serializable: {e}")
+        return
+    dead: list[WebSocket] = []
+    for ws in list(_dashboard_ws_clients):
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _dashboard_ws_clients.discard(ws)
+
+
+def _history_log_transcript_safe(session: "StreamingSession", text: str, language: str) -> None:
+    """Synchronous helper called from the audio WS loop after a MSG_FINAL send.
+    Swallows all exceptions — a broken history DB must NEVER kill dictation.
+    """
+    if session.history_session_id is None:
+        return
+    try:
+        db = history_db.get_default_db()
+        if not db.get_settings().get("logging_enabled"):
+            return
+        tid = db.log_transcript(
+            session_id=session.history_session_id,
+            text=text,
+            language=language,
+        )
+        if tid > 0:
+            # Fire-and-forget broadcast. We schedule on the loop so the
+            # caller (inference path) doesn't wait on network I/O.
+            event = {
+                "type": "transcript",
+                "id": tid,
+                "session_id": session.history_session_id,
+                "text": text,
+                "language": language,
+                "created_at": int(time.time() * 1000),
+            }
+            try:
+                loop = asyncio.get_event_loop()
+                task = loop.create_task(_broadcast_dashboard(event))
+                task.add_done_callback(_task_done)
+            except RuntimeError:
+                # Not in a loop — caller is sync thread without event loop.
+                # Fine: dashboard just won't see real-time, the DB row is logged.
+                pass
+    except Exception as e:
+        log_warning(f"[History] log_transcript failed (non-fatal): {e}")
+
+
+async def _accept_authenticated_ws(ws: WebSocket, cid: int, channel_label: str) -> "str | None":
+    """
+    Run the boilerplate handshake every WS endpoint shared:
+      ws.accept() → origin check → auth → register
+
+    Returns the validated token on full acceptance, or None on any failure
+    (origin reject / unauthorized / concurrency cap). Callers that only
+    care about success/failure can keep the `if not retval:` pattern —
+    Python truthiness works on str vs None. ws_audio_stream uses the token
+    to derive a per-session key for the reconnect buffer so two phones
+    behind the same NAT don't share buffered audio (O-P1-2 hardening).
+
+    Replaces ~20 lines × 4 handlers (audio, trackpad, screen, audio_output)
+    of duplicated try/close/log boilerplate that drifted slightly between
+    handlers (e.g. trackpad logged differently, audio_output's reason text
+    differed). Single source kills future drift.
+    """
     await ws.accept()
-    if not await _authenticate_ws(ws):
+    if not _validate_ws_origin(ws):
+        _ws_log(cid, "warning", f"[{channel_label}] Origin rejected: {ws.headers.get('origin', '')}")
+        try:
+            await ws.close(code=4403, reason="Origin not allowed")
+        except Exception:
+            pass
+        return None
+    token = await _authenticate_ws(ws)
+    if not token:
         try:
             await ws.close(code=4401, reason="Unauthorized")
         except Exception:
             pass
-        return
-    _register_ws(ws)
-    log_info("[Stream] WebSocket connected")
+        return None
+    if not _register_ws(ws):
+        _ws_log(cid, "warning", f"[{channel_label}] Max concurrent WS limit reached, rejecting")
+        try:
+            await ws.close(code=4429, reason="Too many connections")
+        except Exception:
+            pass
+        return None
+    return token
 
-    # Initialize session
-    # vad_utils is a 5-tuple from Silero: (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks)
-    # EnergyVAD fallback may return fewer elements — guard the unpacking
-    if not vad_utils or len(vad_utils) < 4:
-        log_error("[Stream] VAD utils unavailable or incomplete — cannot start session")
+
+async def ws_audio_stream(ws: WebSocket):
+    """Main WebSocket handler for audio streaming.
+
+    Architecture: the receive loop and the frame processor run as SEPARATE
+    asyncio tasks connected by an asyncio.Queue. Previously both ran serially
+    in one task — while inference was running (300ms–3s), `ws.receive_bytes()`
+    never got scheduled, so the kernel's TCP buffer accumulated incoming audio
+    and the first syllable of the user's next sentence was lost after every
+    transcription. Now frames queue up while inference runs; the processor
+    catches up without stalling the receiver.
+    """
+    global _last_ws_activity
+    cid = _resolve_cid(ws)
+    client_ip = ws.client.host if ws.client else "unknown"
+    token = await _accept_authenticated_ws(ws, cid, "Stream")
+    if not token:
+        return
+    # O-P1-2: derive a stable per-session suffix so the reconnect buffer is
+    # keyed by (ip, token_hash). sha256(token)[:16] = 64 bits of entropy —
+    # collision-safe at any realistic session count, and the raw token never
+    # lands in a dict key that might surface in logs/diagnostics.
+    import hashlib as _hl
+    buffer_key: tuple[str, str] = (client_ip, _hl.sha256(token.encode()).hexdigest()[:16])
+    _ws_log(cid, "info", f"[Stream] Audio WS connected from {client_ip}")
+
+    # Initialize session. vad_utils is a 5-tuple — either Silero's native tuple or
+    # the EnergyVAD fallback's synthesized 5-tuple (see stt_common.load_vad). As
+    # long as utils[3] is callable as `VADIterator(model, sampling_rate=...)` and
+    # returns an object with `__call__(audio_tensor, return_seconds=False)` and
+    # `reset_states()`, the streaming path works regardless of backend.
+    if not vad_utils or len(vad_utils) < 4 or vad_utils[3] is None:
+        _ws_log(cid, "error", "[Stream] VAD not available — cannot start session")
         await ws.close(code=4500, reason="VAD unavailable")
         _unregister_ws(ws)
         return
     VADIterator = vad_utils[3]
     session = StreamingSession()
     session.vad_iterator = VADIterator(vad_model, sampling_rate=SAMPLE_RATE)
+    clean_end = False  # Codex F3: only set True on MSG_END_SESSION receipt
 
-    # Warn phone immediately if macOS Accessibility is missing — transcription will
-    # succeed but type_text() will silently discard all output.
     input_ok, input_err = check_input_health()
     if not input_ok:
         session._input_health_warned = True
         await send_message(ws, MSG_ERROR, input_err.encode('utf-8'))
+
+    # Bounded queue: 120 frames × 32ms = ~4 s of audio in flight. If the
+    # processor falls more than 4 s behind (Whisper doing 30 s of audio on CPU),
+    # drop-oldest rather than growing unbounded memory.
+    frame_queue: asyncio.Queue = asyncio.Queue(maxsize=120)
+
+    async def _processor_loop():
+        """Drains frame_queue and feeds handle_audio_frame. Isolated from
+        ws.receive_bytes() so inference never starves the receiver."""
+        while True:
+            item = await frame_queue.get()
+            if item is None:
+                return  # sentinel — shut down
+            try:
+                await handle_audio_frame(session, ws, item)
+            except Exception as e:
+                _ws_log(cid, "debug", f"[Stream] processor frame error: {e}")
+
+    processor_task = asyncio.create_task(_processor_loop())
+    processor_task.add_done_callback(_task_done)
+
+    def _enqueue_frame(payload: bytes):
+        """Drop-oldest on overflow so slow processor can't stall receive loop."""
+        try:
+            frame_queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            try:
+                frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                frame_queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
+
+    async def _drain_and_flush(final: bool):
+        """Wait for processor to consume outstanding frames, then run final
+        inference on any remaining speech buffer. Used for END_SESSION and
+        the disconnect-cleanup path."""
+        # Signal processor to stop after draining what's queued.
+        try:
+            frame_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            # Queue full — drop a frame so sentinel fits.
+            try:
+                frame_queue.get_nowait()
+                frame_queue.put_nowait(None)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+        try:
+            await asyncio.wait_for(processor_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            _ws_log(cid, "warning", "[Stream] processor drain timed out, cancelling")
+            processor_task.cancel()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _ws_log(cid, "debug", f"[Stream] processor drain error: {e}")
+
+        if final and session.audio_buffer:
+            if not session.had_speech:
+                session.had_speech = True  # force flush audio-without-VAD-trigger
+            if not session.pending_inference:
+                try:
+                    await run_inference(session, ws)
+                except Exception as e:
+                    _ws_log(cid, "debug", f"[Stream] final flush inference error: {e}")
 
     try:
         while True:
             try:
                 data = await ws.receive_bytes()
             except WebSocketDisconnect as e:
-                log_info(f"[Stream] Client disconnected (code={e.code})")
+                _ws_log(cid, "info", f"[Stream] Client disconnected (code={e.code})")
                 break
             except Exception as e:
-                log_error(f"[Stream] Receive error: {e}")
+                _ws_log(cid, "error", f"[Stream] Receive error: {e}")
                 break
 
             if not data:
                 continue
 
-            # Phone activity → resume app input if paused
             if is_app_input_paused():
                 resume_app_input()
 
@@ -693,60 +1264,99 @@ async def ws_audio_stream(ws: WebSocket):
             if msg_type == MSG_START_SESSION:
                 session.session_active = True
                 session.reset_vad()
+                # v1.2 history: open a sessions row so subsequent WIRE_FINAL
+                # transcripts can attach. Skipped if logging is disabled so we
+                # don't accumulate empty session rows.
+                try:
+                    db = history_db.get_default_db()
+                    if db.get_settings().get("logging_enabled"):
+                        # Client kind inferred from User-Agent when possible — the
+                        # Android app sets its UA; Chrome ext sets its own; the
+                        # local web client leaves it blank.
+                        ua = (ws.headers.get("user-agent") or "").lower()
+                        if "sanketra" in ua and "android" in ua:
+                            client_kind = "android"
+                        elif "chrome-extension" in ua or "chromext" in ua:
+                            client_kind = "chrome"
+                        elif ua:
+                            client_kind = "web"
+                        else:
+                            client_kind = "web"
+                        session.history_session_id = db.create_session(
+                            client_kind=client_kind,
+                            client_name=session.client_name,
+                            language="hi",
+                        )
+                except Exception as e:
+                    log_warning(f"[History] create_session failed (non-fatal): {e}")
+                    session.history_session_id = None
                 await _send_raw(ws, _WIRE_SESSION_READY)
-                log_info("[Stream] Session started")
+                # Replay buffered audio from previous connection (reconnection recovery).
+                # Queued to the processor, not awaited inline — receive loop stays live.
+                reconnect_buf = _audio_reconnect_buffers.get(buffer_key)
+                if reconnect_buf and len(reconnect_buf) > 0:
+                    replay_count = len(reconnect_buf)
+                    for buffered_frame in reconnect_buf:
+                        _enqueue_frame(buffered_frame)
+                    reconnect_buf.clear()
+                    _ws_log(cid, "info", f"[Stream] Queued {replay_count} buffered frames from reconnect")
+                _ws_log(cid, "info", "[Stream] Session started")
 
             elif msg_type == MSG_END_SESSION:
-                log_info("[Stream] End session requested")
-
-                # Flush remaining audio.
-                # P3-9: This synchronous inference call typically completes in <5s
-                # (Whisper beam_size=1 on buffered audio). The client shows a
-                # "Processing..." state while waiting for SESSION_DONE. The Android
-                # client has a 10s safety timeout that clears isProcessing if
-                # SESSION_DONE never arrives (network drop, server crash). That
-                # 10s value is conservative — 99th percentile inference is ~3s on
-                # GPU, ~8s on CPU for 30s audio. The web client relies on WS close
-                # to exit processing state, which is acceptable for browser use.
-                if session.audio_buffer and session.had_speech:
-                    await run_inference(session, ws)
-                elif session.audio_buffer:
-                    # Had audio but no speech detected - transcribe anyway
-                    session.had_speech = True  # Force it
-                    await run_inference(session, ws)
-
-                # Signal done
+                _ws_log(cid, "info", "[Stream] End session requested")
+                await _drain_and_flush(final=True)
                 await _send_raw(ws, _WIRE_SESSION_DONE)
                 session.session_active = False
-
-                # Clean close
+                # v1.2 history: close the sessions row. Idempotent.
+                if session.history_session_id is not None:
+                    try:
+                        history_db.get_default_db().end_session(session.history_session_id)
+                    except Exception as e:
+                        log_warning(f"[History] end_session failed (non-fatal): {e}")
+                clean_end = True  # Codex F3: signal finally to drop reconnect buffer
                 await ws.close(code=1000, reason="Session complete")
-                log_info("[Stream] Session ended cleanly")
+                _ws_log(cid, "info", "[Stream] Session ended cleanly")
                 break
 
             elif msg_type == MSG_AUDIO_FRAME:
                 if session.session_active:
-                    # P2-28: Keep _last_ws_activity fresh so auto_unload_timer
-                    # doesn't unload the model during active audio streaming.
                     _last_ws_activity = time.time()
-                    await handle_audio_frame(session, ws, payload)
+                    if buffer_key not in _audio_reconnect_buffers:
+                        _audio_reconnect_buffers[buffer_key] = deque(maxlen=_RECONNECT_BUFFER_MAX_FRAMES)
+                    _audio_reconnect_buffers[buffer_key].append(payload)
+                    _enqueue_frame(payload)
 
             else:
                 await send_message(ws, MSG_ERROR, b"Unknown message type")
 
     except Exception as e:
-        log_error(f"[Stream] Handler error: {e}")
+        _ws_log(cid, "error", f"[Stream] Handler error: {e}")
     finally:
-        # AU-P0-3: On disconnect, run final inference if buffer has speech data
-        if session.audio_buffer and session.had_speech and not session.pending_inference:
-            try:
-                log_info("[Stream] Disconnect flush — transcribing remaining buffered speech")
-                await run_inference(session, ws)
-            except Exception as e:
-                log_debug(f"[Stream] Disconnect flush failed (WS closing): {e}")
+        # A8-P2-3: Unregister WS BEFORE the flush — frees the WS slot immediately so
+        # other clients can connect while we finish the (potentially slow) final inference.
         _unregister_ws(ws)
+        # Codex F3: only drop the reconnect buffer on a CLEAN END_SESSION. On an
+        # abnormal disconnect (network drop, OEM kill, cert hiccup) we MUST keep
+        # the buffer so the next /ws-audio-stream MSG_START_SESSION can replay
+        # the in-flight audio. Previously we wiped unconditionally → the replay
+        # path at line 951 was effectively dead for disconnect recovery.
+        if clean_end:
+            _audio_reconnect_buffers.pop(buffer_key, None)
+        # If we exited without END_SESSION (disconnect / error), drain + flush anyway.
+        if not processor_task.done():
+            try:
+                await _drain_and_flush(final=True)
+            except Exception as e:
+                _ws_log(cid, "debug", f"[Stream] Disconnect flush failed (WS closing): {e}")
         session.session_active = False
-        log_info(f"[Stream] WebSocket handler ended (processed {session.frames_processed} frames)")
+        # v1.2 history: ensure the session row is closed even on abnormal disconnect.
+        # Idempotent (WHERE ended_at IS NULL guard) so safe even after MSG_END_SESSION.
+        if session.history_session_id is not None:
+            try:
+                history_db.get_default_db().end_session(session.history_session_id)
+            except Exception as e:
+                log_warning(f"[History] end_session (disconnect) failed: {e}")
+        _ws_log(cid, "info", f"[Stream] WebSocket handler ended (processed {session.frames_processed} frames)")
 
 # =============================================================================
 #                              TRACKPAD WEBSOCKET
@@ -758,8 +1368,97 @@ import queue
 # Bypasses TCP/WebSocket entirely — no head-of-line blocking.
 # Auth: first packet must be JSON {"t":"auth","token":"<valid_token>"}.
 # After auth, accepts: {"t":"a","x":...,"y":...}, {"t":"m","x":...,"y":...}, {"t":"s","dy":...}
+#
+# O-P1-3 / F-Apr23-01: auth is tracked by two coordinated dicts.
+#   _udp_authed_clients: (ip, port) -> (auth_timestamp, token_hash)
+#   _udp_token_to_addr:  token_hash -> (ip, port)
+# The reverse index lets a NAT rebind / Wi-Fi↔cellular handoff land on a new
+# (ip, port) without being treated as a new client: if the first packet from
+# the new tuple carries a token whose hash is already mapped, we evict the
+# stale (ip, port) and rewrite the mapping atomically — no wait for the 1 h
+# TTL to reclaim the slot, no stale-entry log-noise. token_hash is
+# sha256(token)[:16] (64 bits, same shape as F-Apr22-02's reconnect-buffer
+# key) so the raw token never lands in a key that might surface in logs.
 _udp_transport = None
-_udp_authed_clients: dict[tuple, bool] = {}  # (ip, port) -> True after auth
+_udp_authed_clients: "dict[tuple, tuple[float, str]]" = {}  # (ip, port) -> (auth_ts, token_hash)
+_udp_token_to_addr: "dict[str, tuple]" = {}  # token_hash -> (ip, port)
+_UDP_CLIENT_TTL = 3600  # 1 hour — evict stale entries
+_UDP_MAX_CLIENTS = 50
+
+
+def _udp_token_hash(token: str) -> str:
+    """64-bit SHA-256 prefix of a UDP-auth token. Matches F-Apr22-02 shape."""
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def _udp_evict(addr: tuple, authed: dict, reverse: dict) -> None:
+    """Remove one (addr) entry from both dicts, keeping them consistent.
+    Safe on addresses that are not present."""
+    entry = authed.pop(addr, None)
+    if entry is None:
+        return
+    _, token_hash = entry
+    # Only drop the reverse mapping if it still points at this addr — another
+    # rebind may have already rewritten it to the new (ip, port).
+    if reverse.get(token_hash) == addr:
+        del reverse[token_hash]
+
+
+def _udp_process_auth(
+    addr: tuple,
+    token_hash: str,
+    now: float,
+    authed: dict,
+    reverse: dict,
+    ttl: float,
+    max_clients: int,
+) -> str:
+    """Install an authenticated (addr, token_hash) pair, evicting stale
+    entries as needed. Returns a short status string for logging:
+      'new'       — first time we've seen this token_hash
+      'rebind'    — token_hash was already authed at a different (ip, port);
+                    the old tuple is evicted and the mapping rewritten
+      'refresh'   — same (addr) and same token_hash, just a timestamp bump
+    Pure-ish: only touches the two dicts passed in (hence testable in
+    isolation — the module-level dicts are the production binding).
+    Ordering: a NAT rebind MUST be handled before the max-clients sweep, or
+    the rebind would count against the cap even though it's replacing, not
+    adding, an entry."""
+    prior_entry = authed.get(addr)  # may be (ts, old_hash) if re-pair on same socket
+    prior_addr = reverse.get(token_hash)
+    if prior_addr is not None and prior_addr != addr:
+        # NAT rebind: same token, new (ip, port). Drop the stale tuple.
+        _udp_evict(prior_addr, authed, reverse)
+        status = "rebind"
+    elif prior_entry is not None:
+        if prior_entry[1] == token_hash:
+            # Same (addr), same token — just a resend/refresh. Not a new slot.
+            status = "refresh"
+        else:
+            # Same (addr), different token (re-pair without tuple change).
+            # Not new capacity, but the OLD token_hash's reverse entry is now
+            # stale — drop it before we install the new hash.
+            if reverse.get(prior_entry[1]) == addr:
+                del reverse[prior_entry[1]]
+            status = "refresh"
+    else:
+        status = "new"
+
+    # Only enforce max-clients on genuinely new slots. 'rebind' and 'refresh'
+    # don't grow the table.
+    if status == "new" and len(authed) >= max_clients:
+        expired = [k for k, v in authed.items() if now - v[0] > ttl]
+        for k in expired:
+            _udp_evict(k, authed, reverse)
+        if len(authed) >= max_clients:
+            # Still full after expiry sweep — evict oldest by auth_ts.
+            oldest = min(authed, key=lambda k: authed[k][0])
+            _udp_evict(oldest, authed, reverse)
+
+    authed[addr] = (now, token_hash)
+    reverse[token_hash] = addr
+    return status
+
 
 class _UdpInputProtocol(asyncio.DatagramProtocol):
     """UDP listener for latency-critical input events (gyro, move, scroll)."""
@@ -781,8 +1480,19 @@ class _UdpInputProtocol(asyncio.DatagramProtocol):
         if t == "auth":
             token = msg.get("token", "")
             if _check_any_token(token):
-                _udp_authed_clients[addr] = True
-                log_info(f"[UDP] Client authenticated: {addr[0]}:{addr[1]}")
+                status = _udp_process_auth(
+                    addr,
+                    _udp_token_hash(token),
+                    time.time(),
+                    _udp_authed_clients,
+                    _udp_token_to_addr,
+                    _UDP_CLIENT_TTL,
+                    _UDP_MAX_CLIENTS,
+                )
+                if status == "rebind":
+                    log_info(f"[UDP] Client rebound: {addr[0]}:{addr[1]} (NAT/network change, same token)")
+                else:
+                    log_info(f"[UDP] Client authenticated: {addr[0]}:{addr[1]}")
                 # Send ACK so Android knows UDP is working (fire-and-forget)
                 try:
                     ack = b'{"t":"ack"}'
@@ -793,9 +1503,15 @@ class _UdpInputProtocol(asyncio.DatagramProtocol):
                 log_warning(f"[UDP] Auth failed from {addr[0]}:{addr[1]}")
             return
 
-        # Reject unauthenticated clients
-        if addr not in _udp_authed_clients:
+        # Reject unauthenticated or expired clients
+        entry = _udp_authed_clients.get(addr)
+        if entry is None or (time.time() - entry[0] > _UDP_CLIENT_TTL):
+            if entry is not None:
+                # Stale — drop it and its reverse mapping.
+                _udp_evict(addr, _udp_authed_clients, _udp_token_to_addr)
             return
+        # Refresh on activity. Token hash doesn't change within a session.
+        _udp_authed_clients[addr] = (time.time(), entry[1])
 
         # Resume app input on any UDP activity (matches WSS path at ws_trackpad)
         if is_app_input_paused():
@@ -821,6 +1537,25 @@ _tp_queue = queue.Queue(maxsize=500)
 _tp_thread = None
 _tp_running = False
 _tp_scroll_stop = threading.Event()  # Signaled by async context, checked by worker to drain scroll events
+
+# Cursor position broadcast: worker thread writes latest pos after each move dispatch.
+# Async sender in ws_trackpad polls at ~30Hz and sends to phone client.
+_cursor_pos_latest = None       # (x, y) tuple, written by _tp_worker
+# A8-P2-4: This is a single shared Event for all trackpad clients. If multiple
+# phones connect simultaneously, they all share the same cursor broadcast signal.
+# In practice this is fine — only one phone controls the cursor at a time, and the
+# 30Hz poll means all connected clients see the same latest position. Per-client
+# events would only matter if clients needed independent cursor state, which they don't.
+_cursor_pos_changed = threading.Event()  # Signaled by worker on cursor move
+
+def _update_cursor_broadcast():
+    """Called by _tp_worker after dispatching a move event. Reads cursor pos from stt_common."""
+    global _cursor_pos_latest
+    pos = get_cursor_position()
+    if pos is not None:
+        sw, sh = get_screen_resolution()
+        _cursor_pos_latest = (pos[0], pos[1], sw, sh)
+        _cursor_pos_changed.set()
 
 def _tp_worker():
     """Dedicated thread for processing trackpad input - minimal latency"""
@@ -890,6 +1625,7 @@ def _tp_worker():
                     except queue.Empty:
                         break
                 mouse_move(total_x, total_y)
+                _update_cursor_broadcast()
             elif t == "a":
                 # Coalesce: skip to latest absolute position (intermediate ones are stale)
                 while not _tp_queue.empty():
@@ -903,17 +1639,23 @@ def _tp_worker():
                     except queue.Empty:
                         break
                 mouse_move_absolute(msg["x"], msg["y"])
+                _update_cursor_broadcast()
             elif t == "rc":
                 sw, sh = get_screen_resolution()
                 mouse_move_absolute(sw // 2, sh // 2)
+                _update_cursor_broadcast()
             elif t == "c":
                 mouse_click(msg.get("b", 1))
             elif t == "d":
                 mouse_drag(msg.get("a", "down"))
             elif t == "k":
                 key_press(msg.get("k", ""))
+            elif t == "txt":
+                type_text(msg.get("text", ""))
             elif t == "s":
-                mouse_scroll(msg.get("dy", 0) * 0.1)
+                raw_dy = msg.get("dy", 0)
+                dy = max(-50, min(50, raw_dy))
+                mouse_scroll(dy * 0.1)
         except queue.Empty:
             pass
         except Exception as e:
@@ -929,16 +1671,21 @@ def _ensure_tp_thread():
 
 async def ws_trackpad(ws: WebSocket):
     """Trackpad WebSocket handler - queues to dedicated thread for minimal latency"""
-    await ws.accept()
-    if not await _authenticate_ws(ws):
+    cid = _resolve_cid(ws)
+    client_ip = ws.client.host if ws.client else "unknown"
+    if not await _accept_authenticated_ws(ws, cid, "Trackpad"):
+        return
+    _ws_log(cid, "info", f"[Trackpad] Connected from {client_ip}")
+    _ensure_tp_thread()
+
+    # Send initial cursor position on connect (so phone overlay starts at correct pos)
+    init_pos = get_cursor_position()
+    if init_pos is not None:
         try:
-            await ws.close(code=4401, reason="Unauthorized")
+            sw, sh = get_screen_resolution()
+            await ws.send_text(json.dumps({"t": "cp", "x": init_pos[0], "y": init_pos[1], "sw": sw, "sh": sh}))
         except Exception:
             pass
-        return
-    _register_ws(ws)
-    print("[Trackpad] Connected", flush=True)
-    _ensure_tp_thread()
 
     # Warn phone on connect if macOS Accessibility is missing (all trackpad input will silently fail)
     input_ok, input_err = check_input_health()
@@ -948,6 +1695,30 @@ async def ws_trackpad(ws: WebSocket):
         except Exception:
             pass
 
+    # Cursor position sender: reads _cursor_pos_changed at ~30Hz,
+    # sends latest cursor pos back to phone for latency-free overlay on screen mirror.
+    cursor_sender_stop = asyncio.Event()
+    async def _cursor_sender():
+        loop = asyncio.get_event_loop()
+        last_sent = None
+        while not cursor_sender_stop.is_set():
+            # Wait for cursor change signal (up to 33ms) via executor to avoid blocking event loop
+            changed = await loop.run_in_executor(None, lambda: _cursor_pos_changed.wait(0.033))
+            if cursor_sender_stop.is_set():
+                break
+            if changed:
+                _cursor_pos_changed.clear()
+            pos = _cursor_pos_latest  # (x, y, sw, sh) tuple
+            if pos is not None and pos != last_sent:
+                last_sent = pos
+                try:
+                    await ws.send_text(json.dumps({"t": "cp", "x": pos[0], "y": pos[1], "sw": pos[2], "sh": pos[3]}))
+                except Exception:
+                    break  # WS closed
+
+    cursor_task = asyncio.create_task(_cursor_sender())
+    cursor_task.add_done_callback(_task_done)
+
     try:
         while True:
             try:
@@ -955,7 +1726,7 @@ async def ws_trackpad(ws: WebSocket):
             except WebSocketDisconnect:
                 break
             except Exception as e:
-                log_warning(f"[Trackpad] WS receive error: {e}")
+                _ws_log(cid, "warning", f"[Trackpad] WS receive error: {e}")
                 break
 
             if not data:
@@ -975,12 +1746,19 @@ async def ws_trackpad(ws: WebSocket):
                 else:
                     _tp_queue.put_nowait(m)
             except queue.Full:
-                log_warning("[Trackpad] Queue full, dropping event")
+                _ws_log(cid, "warning", "[Trackpad] Queue full, dropping event")
             except Exception as e:
-                log_warning(f"[Trackpad] WS message parse error: {e}")
+                _ws_log(cid, "warning", f"[Trackpad] WS message parse error: {e}")
     finally:
+        cursor_sender_stop.set()
+        _cursor_pos_changed.set()  # Wake sender so it can exit cleanly
+        cursor_task.cancel()
+        try:
+            await cursor_task
+        except (asyncio.CancelledError, Exception):
+            pass
         _unregister_ws(ws)
-        print("[Trackpad] Disconnected", flush=True)
+        _ws_log(cid, "info", "[Trackpad] Disconnected")
 
 # =============================================================================
 #                              FASTAPI APP
@@ -998,8 +1776,16 @@ def init_models(preference="balanced", direct_model=None, verbose=True):
     io_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="io")
     _model_load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-load")
 
-    # Load pair lock state from config (persists across restarts)
+    # Load persisted auth token + pair lock state from config (survive restarts)
+    _load_auth_token()
     _load_pair_lock()
+    _load_pair_code()
+    # F-Apr22-03 (+ F-Apr22-04 fix): session load + background writer must run
+    # in BOTH modes. Previously nested inside `if _SERVICE_MODE:` which meant
+    # legacy startup silently lost session persistence (every _mark_sessions_dirty
+    # no-op'd because the writer never spun up).
+    _load_client_sessions()
+    _start_sessions_writer()
 
     if _SERVICE_MODE:
         # Service mode: start IDLE, no model loaded, load on-demand via API
@@ -1008,7 +1794,6 @@ def init_models(preference="balanced", direct_model=None, verbose=True):
         log_info(f"VAD: {get_vad_type()}")
         _server_state = ServerState.IDLE
         _loaded_model_name = None
-        _load_client_sessions()
         log_info("Service mode — IDLE, waiting for model load via API")
         return
 
@@ -1039,10 +1824,17 @@ def init_models(preference="balanced", direct_model=None, verbose=True):
         model_name, compute_type, device = select_model(preference)
 
     global _loaded_device
-    whisper_model = load_whisper(model_name, device=device, compute_type=compute_type)
+    whisper_model, actual_device, actual_precision = load_whisper(
+        model_name, device=device, compute_type=compute_type
+    )
     _loaded_model_name = model_name
-    _loaded_device = device
+    # Record actual device (not requested): load_whisper silently falls back
+    # cuda→cpu on failure. Reporting "cuda" when we're on CPU misled users
+    # into blaming "GPU is slow" when their GPU never loaded at all.
+    _loaded_device = actual_device
     _server_state = ServerState.ACTIVE
+    if actual_device != device:
+        log_warning(f"Whisper loaded on {actual_device} (requested {device})")
 
     vram_after, _, _ = get_gpu_stats()
     if vram_after > vram_before:
@@ -1114,15 +1906,21 @@ def _load_model_async(model_name, precision=None, force_device=None):
         _model_load_progress = 0.3
 
         try:
-            new_model = load_whisper(model_name, device=device, compute_type=precision)
+            new_model, actual_device, actual_precision = load_whisper(
+                model_name, device=device, compute_type=precision
+            )
         except Exception as cuda_err:
             if device == "cuda":
                 log_info(f"CUDA load failed ({cuda_err}), falling back to CPU with int8")
-                device = "cpu"
-                precision = "int8"
-                new_model = load_whisper(model_name, device=device, compute_type=precision)
+                new_model, actual_device, actual_precision = load_whisper(
+                    model_name, device="cpu", compute_type="int8"
+                )
             else:
                 raise
+        # Use actual values returned by load_whisper (it may have fallen back
+        # internally). device/precision args are the REQUEST; actual_* is the TRUTH.
+        device = actual_device
+        precision = actual_precision
 
         # Check cancel again after the expensive load_whisper() call
         if _model_load_cancel:
@@ -1153,7 +1951,8 @@ def _load_model_async(model_name, precision=None, force_device=None):
         _server_state = ServerState.IDLE
         _model_load_progress = 0.0
         log_error(f"Model load failed: {e}")
-        return {"error": str(e)}
+        # A9-P2-10: Don't leak internal exception details to client
+        return {"error": "Model load failed. Check server logs for details."}
 
 
 def _unload_model():
@@ -1185,10 +1984,14 @@ _event_loop = None
 _input_guard_enabled = True  # Set False by --no-input-guard
 
 def _register_ws(ws):
+    """Register WS and check concurrent limit atomically. Returns True if registered, False if limit exceeded."""
     global _last_ws_activity
     with _ws_track_lock:
+        if len(_active_audio_ws) >= _MAX_CONCURRENT_WS:
+            return False
         _active_audio_ws.add(ws)
     _last_ws_activity = time.time()
+    return True
 
 def _unregister_ws(ws):
     global _last_ws_activity
@@ -1222,7 +2025,7 @@ async def _auto_unload_timer():
         # P2-3: Periodic cleanup of rate limit dicts to prevent unbounded growth.
         # Remove IPs whose attempt lists are empty or fully expired.
         now = time.time()
-        for rate_dict, window in [(_pair_attempts, _PAIR_RATE_WINDOW), (_auth_attempts, _AUTH_RATE_WINDOW)]:
+        for rate_dict, window in [(_pair_attempts, _PAIR_RATE_WINDOW), (_auth_attempts, _AUTH_LOCKOUT)]:
             stale_ips = [
                 ip for ip, attempts in rate_dict.items()
                 if not attempts or all(now - t >= window for t in attempts)
@@ -1279,8 +2082,14 @@ def _set_tcp_nodelay_on_server():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler - models already loaded in main"""
-    global _event_loop
+    global _event_loop, _model_load_lock, _pair_mutex
     _event_loop = asyncio.get_event_loop()
+
+    # Create async locks on the running loop. Must happen inside lifespan;
+    # asyncio.Lock() at module import time would bind to whichever loop is
+    # current at import, which may not be the request-serving loop.
+    _model_load_lock = asyncio.Lock()
+    _pair_mutex = asyncio.Lock()
 
     # N-P0-1: Schedule TCP_NODELAY after uvicorn binds sockets (deferred to next tick)
     _event_loop.call_soon(_set_tcp_nodelay_on_server)
@@ -1321,10 +2130,88 @@ async def lifespan(app: FastAPI):
         watchdog_task = asyncio.create_task(_watchdog_shutdown_timer())
         watchdog_task.add_done_callback(_task_done)
 
+    # systemd watchdog: send WATCHDOG=1 heartbeat if running under systemd
+    sd_watchdog_task = None
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if notify_socket:
+        async def _sd_watchdog_loop():
+            """Send sd_notify WATCHDOG=1 at half the WatchdogSec interval."""
+            import socket as _sock
+            watchdog_usec = int(os.environ.get("WATCHDOG_USEC", "0"))
+            if watchdog_usec <= 0:
+                return
+            interval = watchdog_usec / 2_000_000  # Half interval in seconds
+            addr = notify_socket
+            if addr.startswith("@"):
+                addr = "\0" + addr[1:]  # Abstract socket
+            sock = _sock.socket(_sock.AF_UNIX, _sock.SOCK_DGRAM)
+            try:
+                while True:
+                    sock.sendto(b"WATCHDOG=1", addr)
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                sock.close()
+
+        # Notify systemd we're ready
+        try:
+            import socket as _sock
+            _sd_sock = _sock.socket(_sock.AF_UNIX, _sock.SOCK_DGRAM)
+            _sd_addr = notify_socket if not notify_socket.startswith("@") else "\0" + notify_socket[1:]
+            _sd_sock.sendto(b"READY=1", _sd_addr)
+            _sd_sock.close()
+        except Exception as e:
+            log_debug(f"[systemd] sd_notify READY failed: {e}")
+
+        sd_watchdog_task = asyncio.create_task(_sd_watchdog_loop())
+        sd_watchdog_task.add_done_callback(_task_done)
+        log_info("[systemd] Watchdog heartbeat active")
+
+    # D-Bus lid close listener (Linux only) — close WS connections before sleep
+    lid_close_task = None
+    if PLATFORM == 'linux':
+        async def _dbus_sleep_listener():
+            """Listen for org.freedesktop.login1 PrepareForSleep signal.
+            When laptop lid closes, close all WS cleanly so clients auto-reconnect on wake."""
+            try:
+                import dbus
+                from dbus.mainloop.glib import DBusGMainLoop
+                DBusGMainLoop(set_as_default=True)
+                bus = dbus.SystemBus()
+                def on_prepare_sleep(sleeping):
+                    if sleeping:
+                        log_info("[D-Bus] System going to sleep — clients will auto-reconnect on wake")
+                    else:
+                        log_info("[D-Bus] System woke up")
+                bus.add_signal_receiver(
+                    on_prepare_sleep,
+                    signal_name='PrepareForSleep',
+                    dbus_interface='org.freedesktop.login1.Manager',
+                    bus_name='org.freedesktop.login1',
+                )
+                # Keep the listener alive
+                while True:
+                    await asyncio.sleep(60)
+            except ImportError:
+                log_debug("[D-Bus] python-dbus not installed — lid close detection disabled")
+            except Exception as e:
+                log_debug(f"[D-Bus] Sleep listener failed: {e}")
+
+        lid_close_task = asyncio.create_task(_dbus_sleep_listener())
+        lid_close_task.add_done_callback(_task_done)
+
     yield
 
     # Cleanup
     log_info("[Shutdown] Starting graceful shutdown...")
+
+    # F-Apr22-03: flush any pending session writes BEFORE other teardown
+    # so even a crash during GPU cleanup still leaves durable state on disk.
+    try:
+        await _drain_sessions_writer()
+    except Exception as e:
+        log_warning(f"[Shutdown] sessions drain error (non-fatal): {e}")
 
     if udp_transport:
         udp_transport.close()
@@ -1332,6 +2219,10 @@ async def lifespan(app: FastAPI):
         unload_task.cancel()
     if watchdog_task:
         watchdog_task.cancel()
+    if sd_watchdog_task:
+        sd_watchdog_task.cancel()
+    if lid_close_task:
+        lid_close_task.cancel()
     input_monitor.stop_monitor()
 
     # P2-29: Kill all active ffmpeg processes on shutdown (before GPU cleanup —
@@ -1405,7 +2296,7 @@ _LAN_NETS = [
     _ipaddr.ip_network("fe80::/10"),   # IPv6 link-local
     _ipaddr.ip_network("fc00::/7"),    # IPv6 ULA (private)
 ]
-_MAX_CONCURRENT_WS = 6  # N-P1-1: 3 WS types (audio/trackpad/screen) + headroom for reconnect overlap
+_MAX_CONCURRENT_WS = 8  # 4 WS types (audio-in/trackpad/screen/audio-out) + headroom for reconnect overlap
 
 @app.middleware("http")
 async def lan_only_middleware(request: Request, call_next):
@@ -1424,6 +2315,18 @@ async def lan_only_middleware(request: Request, call_next):
     # Security headers
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    # A19-P2-5: CSP — allows inline styles/scripts (embedded web client), wss: for WebSocket,
+    # blob: for AudioWorklet, media: for video. Defense-in-depth against XSS injection.
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self' wss: ws:; "
+        "media-src 'self' blob:; "
+        "worker-src 'self' blob:; "
+        "img-src 'self' data:; "
+        "frame-ancestors 'none'"
+    )
     return response
 
 # =============================================================================
@@ -1439,6 +2342,13 @@ _NAL_PPS       = 8   # Picture parameter set
 _NAL_AUD       = 9   # Access unit delimiter
 
 _SCREEN_FLAG_KEY = 0x01  # Keyframe flag in wire format
+
+# Screen quality control: client → server [0x21][level:1]
+# Levels: 0=480p, 1=720p, 2=1080p
+MSG_QUALITY_CTRL = 0x21
+_QUALITY_LEVELS = {0: '480p', 1: '720p', 2: '1080p'}
+# A11-P3-1: Module-level constant (was re-created per WS session)
+_RES_PRESETS = {'1080p': (1920, 1080), '720p': (1280, 720), '480p': (854, 480)}
 
 def _get_nal_type_at(buf, start_code_pos):
     """Get NAL unit type byte at a start code position."""
@@ -1532,11 +2442,15 @@ def _read_h264_frames(pipe, frame_queue: queue.Queue, stop_event: threading.Even
                 if nal_type == _NAL_SPS:
                     pending_is_key = True
 
-    # Signal end to consumer
+    # Signal end to consumer — sentinel MUST be delivered, so evict oldest if full
     try:
         frame_queue.put_nowait(None)
     except queue.Full:
-        pass
+        try:
+            frame_queue.get_nowait()  # Evict oldest frame to make room
+            frame_queue.put_nowait(None)
+        except (queue.Empty, queue.Full):
+            pass  # Should not happen after eviction, but guard anyway
 
 
 def _find_start_code(buf, offset=0):
@@ -1553,31 +2467,63 @@ def _find_start_code(buf, offset=0):
     return idx  # 3-byte start code
 
 
-def _get_avfoundation_screen_device():
+def _get_avfoundation_screen_device(monitor_index=0):
     """Parse avfoundation device list to find screen capture device index.
-    Returns device string like '2:' for -i flag. Defaults to '1:' if parsing fails."""
+    Returns device string like '2:' for -i flag. Defaults to '1:' if parsing fails.
+    monitor_index: 0=primary, 1=secondary, etc. Matches CGGetActiveDisplayList order.
+    UNTESTED: requires real multi-monitor macOS hardware."""
     try:
         p = subprocess.run(
             ['ffmpeg', '-nostdin', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''],
             capture_output=True, text=True, timeout=5,
         )
-        # Device list is printed to stderr
+        # Collect ALL "Capture screen N" devices — avfoundation lists them in
+        # the same order as CGGetActiveDisplayList (documented Apple behavior)
+        screen_devices = []
         for line in (p.stderr or '').splitlines():
-            # Look for "Capture screen" line, e.g.: [AVFoundation ...] [2] Capture screen 0
             if 'Capture screen' in line:
                 m = re.search(r'\[(\d+)\]', line)
                 if m:
-                    return f'{m.group(1)}:'
+                    screen_devices.append(m.group(1))
+        if screen_devices:
+            idx = min(monitor_index, len(screen_devices) - 1)
+            return f'{screen_devices[idx]}:'
     except Exception:
         pass
     return '1:'  # Default: screen is usually device index 1
 
 def _check_hw_encoder():
     """Probe hardware encoder availability with a short real capture test.
-    Returns encoder name string ('h264_nvenc', 'h264_videotoolbox') or None."""
+    Returns encoder name string ('h264_nvenc', 'h264_vaapi', 'h264_qsv',
+    'h264_videotoolbox') or None.
+
+    Linux probe order (2026): NVENC → VAAPI → QSV → CPU. VAAPI added because
+    NVENC has been intermittently broken on the user's PC (CUDA_ERROR_UNKNOWN
+    after rapid kill/restart cycles); VAAPI uses a different driver path
+    (DRI render node, not CUDA context) so it survives those failures.
+    Encode latency: NVENC 2-5ms, VAAPI 3-6ms, QSV 4-8ms, libx264 8-15ms.
+    """
     plat = PLATFORM
     if plat == 'linux':
         display = os.environ.get('DISPLAY', ':0')
+
+        def _probe(extra_args, encoder_name):
+            try:
+                p = subprocess.run(
+                    ['ffmpeg', '-nostdin', '-y', '-loglevel', 'error',
+                     *extra_args,
+                     '-f', 'x11grab', '-framerate', '10', '-video_size', '64x64',
+                     '-i', display, '-frames:v', '3',
+                     '-vf', 'format=nv12,hwupload' if encoder_name == 'h264_vaapi' else 'format=nv12',
+                     '-c:v', encoder_name, '-f', 'null', '-'],
+                    capture_output=True, timeout=8,
+                )
+                return p.returncode == 0
+            except Exception as e:
+                log_debug(f"[Screen] {encoder_name} probe failed: {e}")
+                return False
+
+        # 1. NVENC (lowest latency when it works)
         try:
             p = subprocess.run(
                 ['ffmpeg', '-nostdin', '-y', '-loglevel', 'error',
@@ -1589,7 +2535,19 @@ def _check_hw_encoder():
             if p.returncode == 0:
                 return 'h264_nvenc'
         except Exception as e:
-            log_debug(f"[Screen] NVENC probe failed on Linux: {e}")
+            log_debug(f"[Screen] NVENC probe failed: {e}")
+
+        # 2. VAAPI — universal fallback (Intel iGPU, AMD VCN, NVIDIA via interop)
+        # Requires /dev/dri/renderD128 (or 129). If neither device exists, skip.
+        for dri_node in ('/dev/dri/renderD128', '/dev/dri/renderD129'):
+            if os.path.exists(dri_node):
+                if _probe(['-vaapi_device', dri_node], 'h264_vaapi'):
+                    log_info(f"[Screen] VAAPI available via {dri_node}")
+                    return 'h264_vaapi'
+
+        # 3. Intel QuickSync (`h264_qsv`)
+        if _probe([], 'h264_qsv'):
+            return 'h264_qsv'
     elif plat == 'windows':
         try:
             p = subprocess.run(
@@ -1604,6 +2562,20 @@ def _check_hw_encoder():
                 return 'h264_nvenc'
         except Exception as e:
             log_debug(f"[Screen] NVENC probe failed on Windows: {e}")
+        # Try QSV on Windows too (Intel laptops are everywhere)
+        try:
+            p = subprocess.run(
+                ['ffmpeg', '-nostdin', '-y', '-loglevel', 'error',
+                 '-f', 'gdigrab', '-framerate', '10', '-video_size', '64x64',
+                 '-i', 'desktop', '-frames:v', '3',
+                 '-c:v', 'h264_qsv', '-f', 'null', '-'],
+                capture_output=True, timeout=8,
+                creationflags=0x08000000,
+            )
+            if p.returncode == 0:
+                return 'h264_qsv'
+        except Exception as e:
+            log_debug(f"[Screen] QSV probe failed on Windows: {e}")
     elif plat == 'macos':
         try:
             screen_dev = _get_avfoundation_screen_device()
@@ -1649,12 +2621,17 @@ def _get_ffmpeg_display():
     return display  # Last resort, use whatever was set
 
 def _build_ffmpeg_cmd(out_w, out_h, fps, hw_encoder=None,
-                      screen_w=None, screen_h=None, display=None):
+                      screen_w=None, screen_h=None, display=None,
+                      monitor_x=0, monitor_y=0, monitor_index=0):
     """Build ffmpeg command for screen capture (pure function, no side effects).
 
     Captures at full screen resolution and scales down to out_w x out_h
     so the entire desktop is visible (no cropping).
+    monitor_x/monitor_y: pixel offset for multi-monitor (x11grab/gdigrab).
     Platform-aware: x11grab (Linux), gdigrab (Windows), avfoundation (macOS).
+    A7-P1-4: On Wayland, x11grab captures via XWayland compatibility layer. This captures
+    XWayland windows only (not native Wayland windows). PipeWire/wlr-screencopy would be needed
+    for native capture but have no ffmpeg input support as of 2026.
     """
     plat = PLATFORM
     cap_w = screen_w or out_w
@@ -1671,24 +2648,37 @@ def _build_ffmpeg_cmd(out_w, out_h, fps, hw_encoder=None,
 
     cmd = ['ffmpeg', '-nostdin', '-loglevel', 'error']
 
+    # VAAPI requires the device to be initialized BEFORE the input. If we're going
+    # to use VAAPI encoding, declare the render node up front. /dev/dri/renderD128
+    # is the standard name; renderD129 covers dual-GPU systems.
+    if hw_encoder == 'h264_vaapi':
+        for dri_node in ('/dev/dri/renderD128', '/dev/dri/renderD129'):
+            if os.path.exists(dri_node):
+                cmd += ['-vaapi_device', dri_node]
+                break
+
     # Platform-specific input
     if plat == 'linux':
+        # x11grab: display+offset for multi-monitor, e.g. ":0+2560,0"
+        grab_input = display or ':0'
+        if monitor_x or monitor_y:
+            grab_input = f'{grab_input}+{monitor_x},{monitor_y}'
         cmd += [
             '-f', 'x11grab',
             '-framerate', str(fps),
             '-video_size', f'{cap_w}x{cap_h}',
-            '-i', display or ':0',
+            '-i', grab_input,
         ]
     elif plat == 'windows':
         cmd += [
             '-f', 'gdigrab',
             '-framerate', str(fps),
-            '-offset_x', '0', '-offset_y', '0',  # Pin to primary monitor on multi-monitor setups
+            '-offset_x', str(monitor_x), '-offset_y', str(monitor_y),
             '-video_size', f'{cap_w}x{cap_h}',
             '-i', 'desktop',
         ]
     elif plat == 'macos':
-        screen_dev = _get_avfoundation_screen_device()
+        screen_dev = _get_avfoundation_screen_device(monitor_index)
         cmd += [
             '-f', 'avfoundation',
             '-framerate', str(fps),
@@ -1698,12 +2688,18 @@ def _build_ffmpeg_cmd(out_w, out_h, fps, hw_encoder=None,
     else:
         raise RuntimeError(f"Screen mirror not supported on {plat}")
 
-    # Scale filter: only if capture != output resolution
-    if cap_w != out_w or cap_h != out_h:
-        cmd += ['-vf', f'scale={out_w}:{out_h}']
-    elif plat == 'macos':
-        # macOS avfoundation captures at native (Retina) resolution, always need scale
-        cmd += ['-vf', f'scale={out_w}:{out_h}']
+    # Scale filter chain. VAAPI needs an extra hwupload step to get frames onto
+    # the GPU; the encoder consumes hardware surfaces. We do the scale on CPU
+    # then upload (simpler than scale_vaapi which needs a fully-hardware pipeline
+    # and tends to flake across vendors).
+    needs_scale = (cap_w != out_w or cap_h != out_h) or plat == 'macos'
+    vf_chain = []
+    if needs_scale:
+        vf_chain.append(f'scale={out_w}:{out_h}')
+    if hw_encoder == 'h264_vaapi':
+        vf_chain += ['format=nv12', 'hwupload']
+    if vf_chain:
+        cmd += ['-vf', ','.join(vf_chain)]
 
     # Encoder selection
     use_encoder = hw_encoder or 'libx264'
@@ -1733,6 +2729,34 @@ def _build_ffmpeg_cmd(out_w, out_h, fps, hw_encoder=None,
             '-g', str(fps * 2),
             '-bf', '0',
             '-realtime', '1',
+        ]
+    elif use_encoder == 'h264_vaapi':
+        # VAAPI: universal Linux HW encoder. Bypasses CUDA context entirely so
+        # survives the NVENC/CUDA corruption that has plagued our deployment.
+        cmd += [
+            '-c:v', 'h264_vaapi',
+            '-profile:v', 'constrained_baseline',
+            '-level', level,
+            '-rc_mode', 'CBR',
+            '-b:v', bitrate,
+            '-maxrate', maxrate,
+            '-bufsize', bufsize,
+            '-g', str(fps * 2),
+            '-bf', '0',
+            '-low_power', '1',  # if supported, even lower latency
+        ]
+    elif use_encoder == 'h264_qsv':
+        cmd += [
+            '-c:v', 'h264_qsv',
+            '-preset', 'veryfast',
+            '-profile:v', 'baseline',
+            '-level', level,
+            '-b:v', bitrate,
+            '-maxrate', maxrate,
+            '-bufsize', bufsize,
+            '-g', str(fps * 2),
+            '-bf', '0',
+            '-async_depth', '1',
         ]
     else:
         cmd += [
@@ -1774,11 +2798,13 @@ def _drain_stderr(pipe, label="ffmpeg"):
             log_debug(f"[Screen] stderr pipe close error: {e}")
 
 
-def _start_ffmpeg(w, h, fps, screen_w, screen_h):
+def _start_ffmpeg(w, h, fps, screen_w, screen_h, monitor_x=0, monitor_y=0, monitor_index=0):
     """Start ffmpeg for screen capture. Probes HW encoder once, falls back to libx264.
 
     Key design: NO waiting after Popen — the reader thread must start immediately
     to prevent the pipe buffer from filling and blocking ffmpeg.
+    monitor_x/monitor_y: pixel offset for multi-monitor capture.
+    monitor_index: which monitor (0=primary) — used for macOS avfoundation device selection.
     """
     global _hw_encoder
     plat = PLATFORM
@@ -1804,7 +2830,9 @@ def _start_ffmpeg(w, h, fps, screen_w, screen_h):
     # Build and start command
     cmd, encoder_name = _build_ffmpeg_cmd(w, h, fps, hw_encoder=hw_enc,
                                            screen_w=screen_w, screen_h=screen_h,
-                                           display=display)
+                                           display=display,
+                                           monitor_x=monitor_x, monitor_y=monitor_y,
+                                           monitor_index=monitor_index)
     log_info(f"[Screen] Starting ffmpeg ({encoder_name})")
 
     popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1840,7 +2868,9 @@ def _start_ffmpeg(w, h, fps, screen_w, screen_h):
             log_info("[Screen] Falling back to libx264")
             cmd, encoder_name = _build_ffmpeg_cmd(w, h, fps, hw_encoder=None,
                                                    screen_w=screen_w, screen_h=screen_h,
-                                                   display=display)
+                                                   display=display,
+                                                   monitor_x=monitor_x, monitor_y=monitor_y,
+                                                   monitor_index=monitor_index)
             proc = subprocess.Popen(cmd, **popen_kwargs)
             try:
                 import fcntl
@@ -1867,25 +2897,39 @@ def _start_ffmpeg(w, h, fps, screen_w, screen_h):
 
 async def ws_screen_mirror(ws: WebSocket):
     """WebSocket handler for screen mirroring. NVENC with automatic libx264 fallback."""
-    await ws.accept()
-    if not await _authenticate_ws(ws):
-        try:
-            await ws.close(code=4401, reason="Unauthorized")
-        except Exception:
-            pass
+    cid = _resolve_cid(ws)
+    client_ip = ws.client.host if ws.client else "unknown"
+    if not await _accept_authenticated_ws(ws, cid, "Screen"):
         return
-    _register_ws(ws)
-    log_info("[Screen] Client connected")
+    _ws_log(cid, "info", f"[Screen] Client connected from {client_ip}")
 
-    screen_w, screen_h = get_screen_resolution_physical()
     fps = 30
+    monitor_x = 0
+    monitor_y = 0
+    selected_monitor_index = 0
 
-    # Parse query params for resolution override
+    # Parse query params for resolution override and monitor selection
     query = ws.query_params if hasattr(ws, 'query_params') else {}
     req_res = query.get('res', '')
 
-    # Target box for each preset (fit screen into this box, preserving aspect ratio)
-    _RES_PRESETS = {'1080p': (1920, 1080), '720p': (1280, 720), '480p': (854, 480)}
+    # Multi-monitor: if monitor index specified, capture that monitor
+    req_monitor = query.get('monitor', '')
+    if req_monitor.isdigit():
+        selected_monitor_index = int(req_monitor)
+        monitor_info = get_monitor_by_index(int(req_monitor))
+        if monitor_info:
+            screen_w = monitor_info['width']
+            screen_h = monitor_info['height']
+            monitor_x = monitor_info['x']
+            monitor_y = monitor_info['y']
+            _ws_log(cid, "info", f"[Screen] Monitor {req_monitor}: {screen_w}x{screen_h} at ({monitor_x},{monitor_y})")
+        else:
+            _ws_log(cid, "warning", f"[Screen] Monitor {req_monitor} not found, using primary")
+            screen_w, screen_h = get_screen_resolution_physical()
+    else:
+        screen_w, screen_h = get_screen_resolution_physical()
+
+    # Fit screen into target box, preserving aspect ratio
     if req_res in _RES_PRESETS:
         box_w, box_h = _RES_PRESETS[req_res]
         scale = min(box_w / screen_w, box_h / screen_h)
@@ -1898,19 +2942,73 @@ async def ws_screen_mirror(ws: WebSocket):
     if req_fps.isdigit():
         fps = max(1, min(60, int(req_fps)))
 
-    log_info(f"[Screen] Capture {screen_w}x{screen_h} -> {w}x{h}@{fps}fps")
+    _ws_log(cid, "info", f"[Screen] Capture {screen_w}x{screen_h} -> {w}x{h}@{fps}fps")
 
     # Send config FIRST so client can prepare decoder before frames arrive
     config = struct.pack('<HHB', w, h, fps)  # 5 bytes: width(2) + height(2) + fps(1)
     await ws.send_bytes(bytes([0x20]) + config)  # 0x20 = SCREEN_CONFIG
 
+    # Adaptive quality: track current resolution for quality change detection
+    current_quality = req_res if req_res in _RES_PRESETS else '1080p'
+    quality_change_event = asyncio.Event()
+    pending_quality = {}  # mutable dict shared between sender and receiver tasks
+    # A11-P1-3: Cooldown to prevent oscillation between quality levels
+    _last_quality_change_time = 0.0  # monotonic timestamp of last applied change
+
+    loop = asyncio.get_event_loop()
     proc = None
     reader_thread = None
     stop_event = threading.Event()
     frame_queue = queue.Queue(maxsize=90)  # ~3 seconds buffer at 30fps
+    receiver_task = None
+
+    async def _receive_client_messages():
+        """Listen for client->server messages (quality control) on the screen WS."""
+        # A11-P3-2: Removed unnecessary nonlocal — current_quality and
+        # _last_quality_change_time are only read here, not assigned
+        try:
+            while True:
+                data = await ws.receive_bytes()
+                if len(data) >= 2 and data[0] == MSG_QUALITY_CTRL:
+                    level = data[1]
+                    new_res = _QUALITY_LEVELS.get(level)
+                    if new_res and new_res != current_quality:
+                        # A11-P1-3: Prevent quality oscillation — 30s cooldown between changes
+                        now = time.monotonic()
+                        if now - _last_quality_change_time < 30.0:
+                            _ws_log(cid, "debug", f"[Screen] Quality change {current_quality}->{new_res} suppressed (cooldown)")
+                            continue
+                        _ws_log(cid, "info", f"[Screen] Quality change requested: {current_quality} -> {new_res}")
+                        pending_quality['res'] = new_res
+                        quality_change_event.set()
+        except (WebSocketDisconnect, RuntimeError):
+            pass  # Client disconnected — sender loop will also break
+        except Exception as e:
+            _ws_log(cid, "debug", f"[Screen] Receiver error: {e}")
+
+    def _stop_ffmpeg_proc(p, se, rt):
+        """Stop an ffmpeg process and its reader thread."""
+        se.set()
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        if p:
+            with _ffmpeg_procs_lock:
+                _active_ffmpeg_procs.discard(p)
+        if rt and rt.is_alive():
+            rt.join(timeout=2)
 
     try:
-        proc, encoder = _start_ffmpeg(w, h, fps, screen_w, screen_h)
+        # A8-P2-6: Use io_executor (not default) to avoid contending with
+        # cursor_pos_changed.wait() and frame_queue.get() on the default pool
+        proc, encoder = await loop.run_in_executor(
+            io_executor, lambda: _start_ffmpeg(w, h, fps, screen_w, screen_h,
+                                         monitor_x=monitor_x, monitor_y=monitor_y,
+                                         monitor_index=selected_monitor_index))
 
         # Start reader thread IMMEDIATELY — ffmpeg is already writing to stdout.
         # Any delay here risks filling the pipe buffer and stalling ffmpeg.
@@ -1922,19 +3020,92 @@ async def ws_screen_mirror(ws: WebSocket):
         )
         reader_thread.start()
 
+        # Start receiver task for client messages (quality control)
+        receiver_task = asyncio.create_task(_receive_client_messages())
+        def _task_done_cb(t):
+            if not t.cancelled():
+                exc = t.exception()
+                if exc:
+                    _ws_log(cid, "debug", f"[Screen] Receiver task error: {exc}")
+        receiver_task.add_done_callback(_task_done_cb)
+
         # Sender loop — read frames from queue, send over WebSocket
         # N-P1-4: Track send backpressure; drop P-frames if send is slow
         # N-P2-6: Track keyframe state — drop P-frames after lost keyframe
-        loop = asyncio.get_event_loop()
         _awaiting_keyframe = False  # Set True if a keyframe was dropped
         while True:
+            # Check for pending quality change from client
+            if quality_change_event.is_set():
+                quality_change_event.clear()
+                new_res = pending_quality.pop('res', None)
+                if new_res and new_res in _RES_PRESETS:
+                    box_w, box_h = _RES_PRESETS[new_res]
+                    nscale = min(box_w / screen_w, box_h / screen_h)
+                    new_w = int(screen_w * nscale) & ~1
+                    new_h = int(screen_h * nscale) & ~1
+                    _ws_log(cid, "info", f"[Screen] Quality change: {new_w}x{new_h}@{fps}fps ({new_res})")
+                    new_stop = threading.Event()
+                    new_queue = queue.Queue(maxsize=90)
+                    try:
+                        # A8-P2-6: Use io_executor for blocking ffmpeg ops
+                        new_proc, new_enc = await loop.run_in_executor(
+                            io_executor, lambda nw=new_w, nh=new_h: _start_ffmpeg(
+                                nw, nh, fps, screen_w, screen_h,
+                                monitor_x=monitor_x, monitor_y=monitor_y))
+                    except Exception as qe:
+                        _ws_log(cid, "error", f"[Screen] Quality change ffmpeg start failed: {qe}")
+                        continue
+                    old_proc, old_stop, old_rt = proc, stop_event, reader_thread
+                    await loop.run_in_executor(io_executor, _stop_ffmpeg_proc, old_proc, old_stop, old_rt)
+                    w, h = new_w, new_h
+                    current_quality = new_res
+                    _last_quality_change_time = time.monotonic()  # A11-P1-3: Reset cooldown
+                    cfg = struct.pack('<HHB', w, h, fps)
+                    await ws.send_bytes(bytes([0x20]) + cfg)
+                    stop_event = new_stop
+                    frame_queue = new_queue
+                    proc, encoder = new_proc, new_enc
+                    reader_thread = threading.Thread(
+                        target=_read_h264_frames,
+                        args=(proc.stdout, frame_queue, stop_event),
+                        daemon=True, name="screen-reader",
+                    )
+                    reader_thread.start()
+                    _awaiting_keyframe = False
+                    continue
             try:
                 frame = await loop.run_in_executor(None, lambda: frame_queue.get(timeout=1.0))
             except queue.Empty:
-                # Check if ffmpeg is still alive
+                # Check if ffmpeg is still alive — auto-restart up to 3 times
                 if proc.poll() is not None:
-                    log_error(f"[Screen] ffmpeg exited (code={proc.returncode})")
-                    break
+                    _ws_log(cid, "error", f"[Screen] ffmpeg exited (code={proc.returncode})")
+                    _ffmpeg_restart_count = getattr(proc, '_restart_count', 0)
+                    if _ffmpeg_restart_count >= 3:
+                        _ws_log(cid, "error", "[Screen] ffmpeg crashed 3 times, giving up")
+                        break
+                    backoff = (1 << _ffmpeg_restart_count)  # 1s, 2s, 4s
+                    _ws_log(cid, "info", f"[Screen] Restarting ffmpeg (attempt {_ffmpeg_restart_count + 1}/3, backoff {backoff}s)")
+                    await asyncio.sleep(backoff)
+                    try:
+                        new_stop = threading.Event()
+                        new_queue = queue.Queue(maxsize=90)
+                        new_proc, encoder = await loop.run_in_executor(
+                            io_executor, lambda: _start_ffmpeg(w, h, fps, screen_w, screen_h,
+                                                          monitor_x=monitor_x, monitor_y=monitor_y))
+                        new_proc._restart_count = _ffmpeg_restart_count + 1
+                        _stop_ffmpeg_proc(proc, stop_event, reader_thread)
+                        proc, stop_event, frame_queue = new_proc, new_stop, new_queue
+                        reader_thread = threading.Thread(
+                            target=_read_h264_frames,
+                            args=(proc.stdout, frame_queue, stop_event),
+                            daemon=True, name="screen-reader",
+                        )
+                        reader_thread.start()
+                        _awaiting_keyframe = False
+                        _ws_log(cid, "info", f"[Screen] ffmpeg restarted successfully")
+                    except Exception as restart_err:
+                        _ws_log(cid, "error", f"[Screen] ffmpeg restart failed: {restart_err}")
+                        break
                 continue
 
             if frame is None:
@@ -1946,7 +3117,7 @@ async def ws_screen_mirror(ws: WebSocket):
             if _awaiting_keyframe:
                 if is_key:
                     _awaiting_keyframe = False
-                    log_debug("[Screen] Keyframe received — resuming send")
+                    _ws_log(cid, "debug", "[Screen] Keyframe received — resuming send")
                 else:
                     continue  # Drop P-frame (would decode to garbage)
 
@@ -1966,16 +3137,210 @@ async def ws_screen_mirror(ws: WebSocket):
             except Exception as e:
                 if is_key:
                     _awaiting_keyframe = True
-                    log_warning(f"[Screen] Keyframe send failed — will skip until next keyframe: {e}")
+                    _ws_log(cid, "warning", f"[Screen] Keyframe send failed — will skip until next keyframe: {e}")
                 break
 
     except WebSocketDisconnect:
-        log_info("[Screen] Client disconnected")
+        _ws_log(cid, "info", "[Screen] Client disconnected")
     except RuntimeError as e:
-        log_error(f"[Screen] Failed to start: {e}")
+        _ws_log(cid, "error", f"[Screen] Failed to start: {e}")
     except Exception as e:
-        log_error(f"[Screen] Error: {e}")
+        _ws_log(cid, "error", f"[Screen] Error: {e}")
     finally:
+        if receiver_task and not receiver_task.done():
+            receiver_task.cancel()
+        _unregister_ws(ws)
+        await loop.run_in_executor(None, _stop_ffmpeg_proc, proc, stop_event, reader_thread)
+        _ws_log(cid, "info", "[Screen] Session ended")
+
+
+# =============================================================================
+#                         AUDIO OUTPUT (PC → Phone)
+# =============================================================================
+
+def _get_pulse_monitor_source():
+    """Detect the PulseAudio/PipeWire monitor source for system audio capture.
+    Returns the monitor source name (e.g. 'alsa_output.pci-xxx.analog-stereo.monitor')
+    or None if detection fails."""
+    try:
+        result = subprocess.run(
+            ['pactl', 'get-default-sink'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip() + '.monitor'
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ['pactl', 'list', 'short', 'sources'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split('\t')
+                if len(parts) >= 2 and '.monitor' in parts[1]:
+                    return parts[1]
+    except Exception:
+        pass
+    return None
+
+def _get_audio_capture_cmd():
+    """Build ffmpeg command for system audio capture → Opus encoding.
+    Returns (cmd_list, description) or (None, error_msg)."""
+    if PLATFORM == 'linux':
+        # PulseAudio/PipeWire: capture the MONITOR source of the default audio sink.
+        # This captures what's playing through speakers, NOT the microphone input.
+        monitor = _get_pulse_monitor_source()
+        if monitor is None:
+            return (None, "No PulseAudio monitor source found (is PulseAudio/PipeWire running?)")
+        return ([
+            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-f', 'pulse', '-i', monitor,
+            '-ac', '1', '-ar', '48000',
+            '-c:a', 'libopus', '-b:a', '64k',
+            '-application', 'audio',
+            '-f', 'opus', '-page_duration', '20000',
+            'pipe:1',
+        ], f"PulseAudio monitor: {monitor}")
+    elif PLATFORM == 'windows':
+        # Windows: WASAPI loopback via dshow virtual audio capturer
+        # Requires "Stereo Mix" or similar enabled, or a virtual audio device
+        return ([
+            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-f', 'dshow', '-i', 'audio=Stereo Mix',
+            '-ac', '1', '-ar', '48000',
+            '-c:a', 'libopus', '-b:a', '64k',
+            '-application', 'audio',
+            '-f', 'opus', '-page_duration', '20000',
+            'pipe:1',
+        ], "Windows Stereo Mix (dshow)")
+    elif PLATFORM == 'macos':
+        # macOS: avfoundation audio device 0 (system audio requires BlackHole or similar)
+        return ([
+            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-f', 'avfoundation', '-i', ':0',
+            '-ac', '1', '-ar', '48000',
+            '-c:a', 'libopus', '-b:a', '64k',
+            '-application', 'audio',
+            '-f', 'opus', '-page_duration', '20000',
+            'pipe:1',
+        ], "macOS avfoundation audio device :0")
+    return (None, f"Unsupported platform: {PLATFORM}")
+
+
+async def ws_audio_output(ws: WebSocket):
+    """WebSocket handler for streaming system audio (PC speaker → phone).
+    Captures system audio via ffmpeg, encodes to Opus, sends as binary frames."""
+    cid = _resolve_cid(ws)  # A8-P3-2: correlation ID (phone-supplied X-Conn-Id if present)
+    if not await _accept_authenticated_ws(ws, cid, "AudioOut"):
+        return
+    _ws_log(cid, "info", "[AudioOut] Client connected")
+
+    cmd, desc = _get_audio_capture_cmd()
+    if cmd is None:
+        _ws_log(cid, "error", f"[AudioOut] Cannot capture: {desc}")
+        try:
+            await ws.send_text(json.dumps({"error": desc}))
+            await ws.close(code=4500, reason=desc)
+        except Exception:
+            pass
+        _unregister_ws(ws)
+        return
+
+    _ws_log(cid, "info", f"[AudioOut] Capturing via {desc}")
+
+    proc = None
+    recv_task = None
+    stop_event = threading.Event()
+    audio_queue = queue.Queue(maxsize=200)  # ~4 seconds at 50 packets/sec
+
+    def _read_opus_packets(stdout, q, stop_ev):
+        """Read Opus packets from ffmpeg stdout pipe and queue them."""
+        try:
+            while not stop_ev.is_set():
+                # Read OGG/Opus stream — each page contains one or more Opus packets.
+                # For simplicity, read in fixed-size chunks. The Android decoder
+                # handles partial/multiple packets per chunk gracefully.
+                data = stdout.read(4096)
+                if not data:
+                    break
+                try:
+                    q.put_nowait(data)
+                except queue.Full:
+                    try:
+                        q.get_nowait()  # Drop oldest
+                    except queue.Empty:
+                        pass
+                    try:
+                        q.put_nowait(data)
+                    except queue.Full:
+                        pass
+        except Exception as e:
+            if not stop_ev.is_set():
+                log_warning(f"[AudioOut] Reader error: {e}")
+        finally:
+            q.put(None)  # Sentinel
+
+    try:
+        env = os.environ.copy()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        with _ffmpeg_procs_lock:
+            _active_ffmpeg_procs.add(proc)
+
+        reader_thread = threading.Thread(
+            target=_read_opus_packets,
+            args=(proc.stdout, audio_queue, stop_event),
+            daemon=True,
+            name="audio-out-reader",
+        )
+        reader_thread.start()
+
+        # Also start a task to receive messages from client (e.g. disconnect signal)
+        async def _recv_loop():
+            try:
+                while True:
+                    await ws.receive()
+            except (WebSocketDisconnect, Exception):
+                pass
+
+        recv_task = asyncio.create_task(_recv_loop())
+        recv_task.add_done_callback(_task_done)
+
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                data = await loop.run_in_executor(None, lambda: audio_queue.get(timeout=1.0))
+            except queue.Empty:
+                if proc.poll() is not None:
+                    _ws_log(cid, "error", f"[AudioOut] ffmpeg exited (code={proc.returncode})")
+                    break
+                continue
+
+            if data is None:
+                break  # Reader done
+
+            try:
+                await ws.send_bytes(data)
+            except Exception:
+                break
+
+    except WebSocketDisconnect:
+        _ws_log(cid, "info", "[AudioOut] Client disconnected")
+    except Exception as e:
+        _ws_log(cid, "error", f"[AudioOut] Error: {e}")
+    finally:
+        if recv_task and not recv_task.done():
+            recv_task.cancel()
+            try:
+                await recv_task
+            except (asyncio.CancelledError, Exception):
+                pass
         _unregister_ws(ws)
         stop_event.set()
         if proc and proc.poll() is None:
@@ -1984,13 +3349,11 @@ async def ws_screen_mirror(ws: WebSocket):
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        # Remove from active set (P2-29)
+                proc.wait()
         if proc:
             with _ffmpeg_procs_lock:
                 _active_ffmpeg_procs.discard(proc)
-        if reader_thread and reader_thread.is_alive():
-            reader_thread.join(timeout=2)
-        log_info("[Screen] Session ended")
+        _ws_log(cid, "info", "[AudioOut] Session ended")
 
 
 @app.websocket("/ws-audio-stream")
@@ -1999,11 +3362,30 @@ async def websocket_audio_endpoint(websocket: WebSocket):
 
 @app.websocket("/ws-tp")
 async def websocket_trackpad_endpoint(websocket: WebSocket):
-    await ws_trackpad(websocket)
+    global _active_trackpad_ws
+    _active_trackpad_ws += 1
+    try:
+        await ws_trackpad(websocket)
+    finally:
+        _active_trackpad_ws = max(0, _active_trackpad_ws - 1)
 
 @app.websocket("/ws-screen")
 async def websocket_screen_endpoint(websocket: WebSocket):
-    await ws_screen_mirror(websocket)
+    global _active_screen_ws
+    _active_screen_ws += 1
+    try:
+        await ws_screen_mirror(websocket)
+    finally:
+        _active_screen_ws = max(0, _active_screen_ws - 1)
+
+@app.websocket("/ws-audio-out")
+async def websocket_audio_output_endpoint(websocket: WebSocket):
+    global _active_audio_out_ws
+    _active_audio_out_ws += 1
+    try:
+        await ws_audio_output(websocket)
+    finally:
+        _active_audio_out_ws = max(0, _active_audio_out_ws - 1)
 
 @app.get("/")
 async def index():
@@ -2013,28 +3395,81 @@ async def index():
         headers={"Cache-Control": "private, max-age=300"},  # 5 min cache — only changes on restart
     )
 
+# Codex F-Apr21-05: serve PC dashboard + its static assets. Dashboard HTML is
+# public (no auth required for the page itself); the JS bootstraps the user's
+# token from URL ?token= or localStorage and adds it to all subsequent
+# /api/history/* + /api/vocab + /api/accent fetches + /ws-dashboard.
+_static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "static")
+
+@app.get("/dashboard")
+async def dashboard_html():
+    """Serve the dashboard SPA. Token bootstrapped client-side."""
+    try:
+        with open(os.path.join(_static_dir, "dashboard.html"), "rb") as f:
+            html = f.read()
+        return Response(content=html, media_type="text/html",
+                        headers={"Cache-Control": "private, max-age=60"})
+    except FileNotFoundError:
+        return Response(status_code=404, content=b"dashboard.html missing")
+
+@app.get("/static/{filename:path}")
+async def static_files(filename: str):
+    """Serve dashboard.css, dashboard.js (and future static assets)."""
+    # Hard whitelist — only files that exist in static/. Prevents path traversal.
+    safe = os.path.basename(filename)
+    if safe != filename or ".." in filename:
+        return Response(status_code=404)
+    full = os.path.join(_static_dir, safe)
+    if not os.path.isfile(full):
+        return Response(status_code=404)
+    ct = "text/css" if safe.endswith(".css") else \
+         "application/javascript" if safe.endswith(".js") else \
+         "text/html" if safe.endswith(".html") else \
+         "application/octet-stream"
+    with open(full, "rb") as f:
+        return Response(content=f.read(), media_type=ct,
+                        headers={"Cache-Control": "private, max-age=300"})
+
 @app.get("/api/screen")
-async def screen_info(request: Request, token: str = Query(None)):
+async def screen_info(request: Request, token: str = Query(None), monitor: int = Query(None)):
     if not _check_any_token(_extract_token(request, token)):
         return Response(status_code=401)
+    # If monitor index specified, return that monitor's resolution + position
+    if monitor is not None:
+        m = get_monitor_by_index(monitor)
+        if m:
+            return {"w": m['width'], "h": m['height'], "x": m['x'], "y": m['y'], "monitor": monitor}
+        return JSONResponse({"error": f"Monitor {monitor} not found"}, status_code=404)
     w, h = get_screen_resolution()
     return {"w": w, "h": h}
+
+@app.get("/api/monitors")
+async def api_monitors(request: Request, token: str = Query(None)):
+    """Return list of connected monitors with index, name, resolution, and position."""
+    if not _check_any_token(_extract_token(request, token)):
+        return Response(status_code=401)
+    monitors = get_monitors()
+    return {"monitors": monitors}
 
 def _get_preferred_ip():
     """Default-route IP — typically the Ethernet interface."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
     except Exception:
         return None
 
 @app.get("/api/discover")
 async def api_discover():
-    """LAN discovery endpoint — no auth required, returns service identity"""
-    resp = {"service": "sanketra", "name": platform.node(), "port": SERVER_PORT, "udp_port": _udp_port, "os": platform.system(), "server_id": _get_server_id()}
+    """LAN discovery endpoint — no auth required, returns service identity.
+    A9-P2-1: Exposes hostname (platform.node()), server_id, and udp_port to unauthenticated
+    LAN clients. This is intentional — the Android app needs these fields for service discovery.
+    The LAN middleware restricts this to RFC 1918 IPs in service mode."""
+    resp = {"service": "sanketra", "name": platform.node(), "port": SERVER_PORT, "udp_port": _udp_port, "os": platform.system(), "server_id": _get_server_id(), "pair_code_required": not _pair_locked}
     pip = _get_preferred_ip()
     if pip:
         resp["preferred_ip"] = pip
@@ -2043,49 +3478,73 @@ async def api_discover():
 @app.post("/api/pair")
 async def api_pair(request: Request):
     """SSH-style TOFU pairing — first connect is trusted, returns auth token + cert fingerprint.
-    After first successful pair, pairing is locked. Use /api/unpair to unlock."""
+    After first successful pair, pairing is locked. Use /api/unpair to unlock.
+
+    Atomicity: the rate-limit check, pair-code verify, _pair_locked check, and
+    _set_pair_lock() transition all happen under _pair_mutex. Previously they were
+    4 separate steps — two concurrent correct-code POSTs could both reach the
+    _pair_locked==False check and both "win" the pair.
+    """
     client_ip = request.client.host
 
-    # Per-IP rate limiting: max _PAIR_RATE_LIMIT attempts per _PAIR_RATE_WINDOW seconds
-    # Always applied BEFORE lock check to prevent timing side-channels
-    now = time.time()
-    attempts = _pair_attempts.get(client_ip, [])
-    attempts = [t for t in attempts if now - t < _PAIR_RATE_WINDOW]
-    if len(attempts) >= _PAIR_RATE_LIMIT:
-        log_info(f"PAIR rate-limited: {client_ip} ({len(attempts)} attempts in {_PAIR_RATE_WINDOW}s)")
-        return Response(status_code=429)
-    attempts.append(now)
-    _pair_attempts[client_ip] = attempts
+    if _pair_mutex is None:
+        return JSONResponse({"error": "Server not ready"}, status_code=503)
 
-    # Reject if already paired — only /api/unpair (with valid token) can unlock
-    if _pair_locked:
-        log_info(f"PAIR rejected (locked): {client_ip}")
-        return JSONResponse(
-            {"error": "Pairing locked. Unpair from current device first."},
-            status_code=403,
-        )
-
-    # Return token + cert DER fingerprint for TOFU pinning
-    from cryptography import x509
-    from cryptography.hazmat.primitives.serialization import Encoding
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    root_dir = os.path.dirname(script_dir)
-    cert_path = os.path.join(root_dir, 'cert.pem')
+    # Codex F4: parse the request body BEFORE acquiring _pair_mutex. Reading the
+    # body is unbounded I/O — a slow or stalled client used to block every other
+    # pairing attempt for the duration of its TCP read. Parsing first keeps the
+    # mutex critical section purely to rate-limit + code-compare + lock-set.
     try:
-        with open(cert_path, "rb") as f:
-            cert_obj = x509.load_pem_x509_certificate(f.read())
-        cert_fp = hashlib.sha256(cert_obj.public_bytes(Encoding.DER)).hexdigest()
-    except Exception as e:
-        log_error(f"Failed to load cert for fingerprint: {e}")
-        return Response(status_code=500)
-    if not cert_fp:
-        return Response(status_code=500)
-    _paired_ips.add(client_ip)
+        body = await request.json()
+    except Exception:
+        body = {}
+    submitted_code = str(body.get("pair_code", "")).strip()
 
-    # Lock pairing after first success — persisted to config.json
-    _set_pair_lock(True, device_ip=client_ip)
-    log_info(f"PAIRED successfully with {client_ip} (TOFU) — pairing now LOCKED")
-    return {"token": AUTH_TOKEN, "cert_fp": cert_fp}
+    async with _pair_mutex:
+        now = time.time()
+        attempts = _pair_attempts.get(client_ip, [])
+        attempts = [t for t in attempts if now - t < _PAIR_RATE_WINDOW]
+        if len(attempts) >= _PAIR_RATE_LIMIT:
+            log_info(f"PAIR rate-limited: {client_ip} ({len(attempts)} attempts in {_PAIR_RATE_WINDOW}s)")
+            return JSONResponse(
+                {"error": "Too many attempts. Wait a minute.", "code": "rate_limited"},
+                status_code=429,
+            )
+        attempts.append(now)
+        _pair_attempts[client_ip] = attempts
+        if not submitted_code or not secrets.compare_digest(submitted_code, _pair_code):
+            log_info(f"PAIR rejected (bad pair_code): {client_ip}")
+            return JSONResponse(
+                {"error": "Invalid pair code", "code": "invalid_pair_code"},
+                status_code=403,
+            )
+
+        if _pair_locked:
+            log_info(f"PAIR rejected (locked): {client_ip}")
+            return JSONResponse(
+                {"error": "Pairing locked", "code": "pair_locked"},
+                status_code=403,
+            )
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = os.path.dirname(script_dir)
+        cert_path = os.path.join(root_dir, 'cert.pem')
+        try:
+            with open(cert_path, "rb") as f:
+                cert_obj = x509.load_pem_x509_certificate(f.read())
+            cert_fp = hashlib.sha256(cert_obj.public_bytes(Encoding.DER)).hexdigest()
+        except Exception as e:
+            log_error(f"Failed to load cert for fingerprint: {e}")
+            return Response(status_code=500)
+        if not cert_fp:
+            return Response(status_code=500)
+        _paired_ips.add(client_ip)
+
+        _set_pair_lock(True, device_ip=client_ip)
+        log_info(f"PAIRED successfully with {client_ip} (TOFU) — pairing now LOCKED")
+        return {"token": AUTH_TOKEN, "cert_fp": cert_fp}
 
 @app.post("/api/unpair")
 async def api_unpair(request: Request, token: str = Query(None)):
@@ -2098,6 +3557,13 @@ async def api_unpair(request: Request, token: str = Query(None)):
     log_info(f"UNPAIRED by {request.client.host} — pairing UNLOCKED")
     return JSONResponse({"status": "unpaired"})
 
+@app.get("/api/token-check")
+async def api_token_check(request: Request, token: str = Query(None)):
+    """Lightweight token validation — web client calls on page load to detect stale tokens."""
+    if _check_any_token(_extract_token(request, token)):
+        return JSONResponse({"valid": True})
+    return Response(status_code=401)
+
 @app.post("/api/blink")
 async def blink_screen(request: Request, token: str = Query(None)):
     """Flash the laptop screen 3 times for visual identification"""
@@ -2108,7 +3574,15 @@ async def blink_screen(request: Request, token: str = Query(None)):
         return {"status": "already_blinking"}
     _blink_active = True
     loop = asyncio.get_event_loop()
-    loop.run_in_executor(io_executor, _do_screen_blink)
+    # A9-P3-2: Track the executor future so _blink_active always resets (already in finally,
+    # but this ensures exceptions don't silently disappear). Fire-and-forget is acceptable here
+    # since _do_screen_blink has its own try/finally.
+    fut = loop.run_in_executor(io_executor, _do_screen_blink)
+    def _blink_done(f):
+        exc = f.exception()
+        if exc:
+            log_warning(f"[Blink] Error: {exc}")
+    fut.add_done_callback(_blink_done)
     return {"status": "blinking"}
 
 # =============================================================================
@@ -2116,38 +3590,37 @@ async def blink_screen(request: Request, token: str = Query(None)):
 # =============================================================================
 
 def _verify_session(token: str) -> bool:
-    """Verify a client session token is valid. Rejects expired sessions (30d TTL)."""
+    """Verify a client session token. Side-effects: deletes expired sessions
+    and updates last_used. Pure logic lives in auth_core.verify_session_token."""
     if not token:
         return False
-    # Accept AUTH_TOKEN directly (TOFU pairing token — works in all modes)
-    if secrets.compare_digest(token, AUTH_TOKEN):
-        return True
-    # Per-client session tokens
     with _sessions_lock:
-        session = _client_sessions.get(token)
-        if session:
-            # Reject expired sessions (P2-18: 30-day runtime expiry)
-            created = session.get("created", 0)
-            if time.time() - created > _SESSION_TTL:
+        # auth_core handles the master-token equality + expiry check.
+        if not auth_core.verify_session_token(token, AUTH_TOKEN, _client_sessions):
+            # If a session exists but is expired, prune it so it doesn't accrete.
+            session = _client_sessions.get(token)
+            if session and auth_core.is_session_expired(session):
                 del _client_sessions[token]
-                _save_client_sessions()
-                return False
+                # F-Apr22-03: debounced write — coalesce with other mutators.
+                _mark_sessions_dirty()
+            return False
+        # Touch the session (only needed for non-master tokens)
+        session = _client_sessions.get(token)
+        if session is not None:
             session["last_used"] = time.time()
-            return True
-    return False
+        return True
 
 def _check_auth_rate_limit(ip: str) -> bool:
-    """Returns True if IP is rate-limited (too many failed attempts)."""
+    """Returns True if IP is rate-limited (too many failed attempts).
+    Lockout window is AUTH_LOCKOUT (600 s) — once tripped, IP stays locked
+    for 10 min from last failure regardless of the burst window. Pure logic
+    in auth_core; this wrapper handles the per-IP attempt-list pruning side-
+    effect on the shared _auth_attempts dict."""
     now = time.time()
     attempts = _auth_attempts.get(ip, [])
-    # Clean old attempts
-    attempts = [t for t in attempts if now - t < _AUTH_RATE_WINDOW]
-    _auth_attempts[ip] = attempts
-    if len(attempts) >= _AUTH_RATE_LIMIT:
-        # Check if still in lockout
-        if attempts and (now - attempts[-1]) < _AUTH_LOCKOUT:
-            return True
-    return False
+    pruned = auth_core.prune_auth_attempts(attempts, now)
+    _auth_attempts[ip] = pruned
+    return auth_core.is_auth_rate_limited(pruned, now)
 
 def _record_auth_failure(ip: str):
     """Record a failed auth attempt for rate limiting."""
@@ -2191,12 +3664,16 @@ async def api_auth(request: Request):
                 raise ValueError("mismatch")
         else:
             from argon2 import PasswordHasher
+            # verify() doesn't need params — they're embedded in the hash.
+            # PasswordHasher() with defaults is fine here.
             ph = PasswordHasher()
             ph.verify(stored_hash, password)
     except Exception as e:
         log_debug(f"[Auth] Password verification failed for {client_ip}: {e}")
         _record_auth_failure(client_ip)
         return JSONResponse({"error": "Invalid password"}, status_code=401)
+
+    _auth_attempts.pop(client_ip, None)
 
     # Generate session token
     session_token = secrets.token_urlsafe(32)
@@ -2220,7 +3697,9 @@ async def api_auth(request: Request):
             "created": time.time(),
             "last_used": time.time(),
         }
-        _save_client_sessions()
+        # F-Apr22-03: debounced write — concurrent /api/auth calls collapse
+        # into a single fsync within the 500 ms coalesce window.
+        _mark_sessions_dirty()
 
     # Return session + system info
     sys_info = get_available_models()
@@ -2244,12 +3723,23 @@ async def api_models(request: Request, token: str = Query(None)):
 
 @app.post("/api/model/load")
 async def api_model_load(request: Request, token: str = Query(None)):
-    """Trigger model download/load. Transitions server IDLE → LOADING → ACTIVE."""
+    """Trigger model download/load. Transitions server IDLE → LOADING → ACTIVE.
+    Serialized via _model_load_lock — two concurrent requests used to both pass
+    the LOADING check and start two parallel Whisper loads (OOM risk)."""
     if not _verify_session(_extract_token(request, token)):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-    if _server_state == ServerState.LOADING:
-        return JSONResponse({"error": "Already loading a model"}, status_code=409)
+    # Validate X-Client-Kind up front — the license gate below keys off it.
+    # Unknown header values are rejected rather than silently defaulted; a
+    # misbehaving / tampered client must not accidentally fall into the
+    # `web` (free-only) tier and wedge itself at `small`.
+    client_kind = _client_kind_from_headers(request.headers)
+    if client_kind is None:
+        return JSONResponse(
+            {"error": "invalid X-Client-Kind header",
+             "allowed": sorted(VALID_CLIENT_KINDS)},
+            status_code=400,
+        )
 
     try:
         body = await request.json()
@@ -2258,15 +3748,70 @@ async def api_model_load(request: Request, token: str = Query(None)):
         return JSONResponse({"error": "Invalid request body"}, status_code=400)
 
     model_name = body.get("model", "")
-    precision = body.get("precision")  # Optional, auto-select if None
-    force_device = body.get("device")  # Optional: "cuda" or "cpu" to override auto-detect
+    precision = body.get("precision")
+    force_device = body.get("device")
     valid_models = ["tiny", "base", "small", "medium", "large-v3-turbo", "distil-large-v3", "large-v3"]
     if model_name not in valid_models:
         return JSONResponse({"error": f"Invalid model. Choose from: {valid_models}"}, status_code=400)
 
-    # Load model in dedicated executor (keeps main whisper executor free for transcription)
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(_model_load_executor, _load_model_async, model_name, precision, force_device)
+    # License gate — Pro-only models need a license covering this client's
+    # track (or a Bundle). Free-tier caps at `small` per MONETIZATION.md.
+    # `requires_pro=True` lands in /api/models so client UIs can lock these
+    # visually; this check is the authoritative one.
+    if model_name not in FREE_TIER_MODELS and not _has_license_for_client(client_kind):
+        return JSONResponse(
+            {
+                "error": "model_requires_pro",
+                "model": model_name,
+                "client_kind": client_kind,
+                "free_tier_max": "small",
+                "free_tier_models": sorted(FREE_TIER_MODELS),
+            },
+            status_code=403,
+        )
+    valid_precisions = [None, "auto", "float16", "float32", "int8", "int8_float16", "int8_float32"]
+    if precision is not None and precision not in valid_precisions:
+        return JSONResponse({"error": f"Invalid precision. Choose from: {[p for p in valid_precisions if p]}"}, status_code=400)
+    if precision == "auto":
+        precision = None
+
+    if force_device != "cpu":
+        try:
+            from stt_common import get_vram_free, MODEL_VRAM
+            vram_free = get_vram_free()
+            if vram_free > 0 and model_name in MODEL_VRAM:
+                vram_needed = MODEL_VRAM[model_name].get("float16", 0)
+                if vram_needed > 0 and vram_free < vram_needed * 0.9:
+                    return JSONResponse({
+                        "error": f"Insufficient VRAM: {model_name} needs ~{vram_needed:.1f}GB, "
+                                 f"only {vram_free:.1f}GB free. Try a smaller model or use CPU.",
+                        "vram_free": round(vram_free, 2),
+                        "vram_needed": round(vram_needed, 2),
+                    }, status_code=400)
+        except (ImportError, AttributeError):
+            pass
+
+    # Codex F7: the prior `if _model_load_lock.locked(): return 409` + `async with`
+    # was non-atomic — between the locked() check and the await, another request
+    # could acquire the lock; the loser then *waited* for a multi-second model
+    # load instead of getting the intended 409. Use try-acquire pattern: if we
+    # can't grab the lock immediately, return 409. Lock released after executor.
+    if _model_load_lock is None:
+        return JSONResponse({"error": "Server not ready"}, status_code=503)
+    try:
+        await asyncio.wait_for(_model_load_lock.acquire(), timeout=0.001)
+    except asyncio.TimeoutError:
+        return JSONResponse({"error": "Already loading a model"}, status_code=409)
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            _model_load_executor, _load_model_async, model_name, precision, force_device
+        )
+    finally:
+        _model_load_lock.release()
+    if isinstance(result, dict) and "error" in result:
+        sc = 409 if "Already loading" in result.get("error", "") else 500
+        return JSONResponse(result, status_code=sc)
     return result
 
 @app.get("/api/model/status")
@@ -2295,13 +3840,107 @@ async def api_model_cancel(request: Request, token: str = Query(None)):
     _model_load_cancel = True
     return {"status": "cancelling"}
 
+_admin_update_lock = asyncio.Lock()
+
+@app.post("/api/admin/update")
+async def api_admin_update(request: Request, token: str = Query(None)):
+    """Pull latest code from git and self-restart if changed."""
+    # P0-2: Restrict to localhost only — this endpoint runs git reset + pip install + restart
+    client_ip = request.client.host
+    if client_ip not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+        log_warning(f"[API] admin/update blocked from non-local IP: {client_ip}")
+        return JSONResponse({"error": "Forbidden — localhost only"}, status_code=403)
+
+    if not _verify_session(_extract_token(request, token)):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    if _admin_update_lock.locked():
+        return JSONResponse({"error": "Update already in progress"}, status_code=409)
+
+    async with _admin_update_lock:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        install_dir = os.path.dirname(script_dir)  # parent of src/
+
+        try:
+            # Get current HEAD
+            old_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=install_dir, capture_output=True, text=True, timeout=10
+            ).stdout.strip()
+
+            # Detect default branch (master or main)
+            branch_result = subprocess.run(
+                ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+                cwd=install_dir, capture_output=True, text=True, timeout=10
+            )
+            branch = "master"  # fallback
+            if branch_result.returncode == 0 and branch_result.stdout.strip():
+                branch = branch_result.stdout.strip().split("/")[-1]
+
+            # Fetch
+            fetch = subprocess.run(
+                ["git", "fetch", "origin"],
+                cwd=install_dir, capture_output=True, text=True, timeout=30
+            )
+            if fetch.returncode != 0:
+                log_error(f"[API] git fetch failed: {fetch.stderr}")
+                return JSONResponse({"error": "Git fetch failed"}, status_code=500)
+
+            # Reset to remote branch
+            reset = subprocess.run(
+                ["git", "reset", "--hard", f"origin/{branch}"],
+                cwd=install_dir, capture_output=True, text=True, timeout=10
+            )
+            if reset.returncode != 0:
+                log_error(f"[API] git reset failed: {reset.stderr}")
+                return JSONResponse({"error": "Git reset failed"}, status_code=500)
+
+            # Get new HEAD
+            new_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=install_dir, capture_output=True, text=True, timeout=10
+            ).stdout.strip()
+
+            if old_head and new_head and old_head != new_head:
+                log_info(f"[API] admin/update: code updated {old_head[:8]}→{new_head[:8]}, installing deps + restarting...")
+
+                # Install new dependencies if requirements changed
+                venv_pip = os.path.join(install_dir, "venv", "bin", "pip")
+                if not os.path.exists(venv_pip):
+                    venv_pip = os.path.join(install_dir, "venv", "Scripts", "pip.exe")
+                req_file = os.path.join(install_dir, "requirements.txt")
+                if os.path.exists(venv_pip) and os.path.exists(req_file):
+                    pip_result = subprocess.run(
+                        [venv_pip, "install", "-r", req_file, "-q"],
+                        cwd=install_dir, capture_output=True, text=True, timeout=120
+                    )
+                    # A9-P2-7: Log warning on pip failure but proceed with restart
+                    # (code was already updated; deps may already be satisfied)
+                    if pip_result.returncode != 0:
+                        log_warning(f"[API] pip install returned {pip_result.returncode} — proceeding with restart")
+
+                # Schedule self-restart: SIGTERM triggers clean shutdown,
+                # service manager (systemd/launchd/schtasks) restarts us
+                def _delayed_restart():
+                    time.sleep(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                threading.Thread(target=_delayed_restart, daemon=True).start()
+                return {"status": "updating", "old_head": old_head[:8], "new_head": new_head[:8]}
+            else:
+                return {"status": "up_to_date", "old_head": old_head[:8], "new_head": new_head[:8]}
+
+        except Exception as e:
+            # A9-P2-8: Log full error server-side but don't leak internals to client
+            log_error(f"[API] admin/update failed: {e}")
+            return JSONResponse({"error": "Update failed — check server logs"}, status_code=500)
+
 @app.post("/api/password/set")
 async def api_set_password(request: Request):
     """Set app password (first-time setup, or from SSH remote setup)."""
     # Only allow from localhost or if no password set yet
     client_ip = request.client.host
     existing_hash = _get_app_password_hash()
-    is_local = client_ip in ("127.0.0.1", "::1", "localhost")
+    is_local = client_ip in ("127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1")
 
     if not is_local:
         return JSONResponse({"error": "Password can only be set from localhost."}, status_code=403)
@@ -2317,21 +3956,565 @@ async def api_set_password(request: Request):
     password = body.get("password", "")
     if len(password) < 4:
         return JSONResponse({"error": "Password too short (min 4 chars)"}, status_code=400)
+    if len(password) > 128:
+        return JSONResponse({"error": "Password too long"}, status_code=400)
 
-    # Hash with Argon2id
+    # Hash with Argon2id (RFC 9106 low-memory profile — 64 MiB, 3 iterations, 4 lanes).
+    # HIGH_MEMORY (2 GiB) profile OOMs alongside Whisper on commodity PCs; LOW_MEMORY
+    # is the RFC-recommended floor for memory-constrained hosts and is still
+    # orders-of-magnitude stronger than the old default.
     try:
         from argon2 import PasswordHasher
-        ph = PasswordHasher()
+        try:
+            from argon2.profiles import RFC_9106_LOW_MEMORY
+            ph = PasswordHasher.from_parameters(RFC_9106_LOW_MEMORY)
+        except Exception:
+            ph = PasswordHasher()
         password_hash = ph.hash(password)
         _set_app_password_hash(password_hash)
         return {"status": "ok"}
     except ImportError:
-        # Fallback: use hashlib if argon2 not installed
         import hashlib as hl
         salt = secrets.token_hex(16)
         h = hl.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
         _set_app_password_hash(f"pbkdf2:{salt}:{h}")
         return {"status": "ok", "note": "Using PBKDF2 fallback (install argon2-cffi for Argon2id)"}
+
+@app.get("/api/version")
+async def api_version():
+    """Public version endpoint — no auth needed.
+
+    Useful for clients to check compatibility before pairing, and for
+    Vercel-hosted dashboards to display server version. Exposes:
+    - VERSION (e.g. "1.2.0")
+    - git commit hash (if .git available)
+    - server start time (uptime computable from this + now())
+    """
+    git_hash = "unknown"
+    try:
+        import subprocess
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_root, capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            git_hash = result.stdout.strip() or "unknown"
+    except Exception:
+        pass
+    return {
+        "version": _SERVER_VERSION,
+        "git": git_hash,
+        "started_at": int(_SERVER_START_TIME),
+        "service": "sanketra",
+    }
+
+@app.get("/api/health")
+async def api_health(request: Request, token: str = Query(None)):
+    """Server health: model state, GPU, connections, input guard, uptime."""
+    if not _verify_session(_extract_token(request, token)):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    uptime_s = int(time.time() - _SERVER_START_TIME)
+    gpu_used, gpu_total, gpu_util = get_gpu_stats()
+
+    return {
+        "status": "ok",
+        "version": _SERVER_VERSION,
+        "uptime_seconds": uptime_s,
+        "model": {
+            "state": _server_state.name,
+            "name": _loaded_model_name,
+            "device": _loaded_device,
+        },
+        "gpu": {
+            "used_gb": round(gpu_used, 2),
+            "total_gb": round(gpu_total, 2),
+            "utilization_pct": gpu_util,
+        },
+        "connections": {
+            "audio": len(_active_audio_ws),
+            "trackpad": _active_trackpad_ws,
+            "screen": _active_screen_ws,
+            "audio_out": _active_audio_out_ws,
+        },
+        "input_guard": _input_guard_enabled,
+        "service_mode": _SERVICE_MODE,
+    }
+
+
+# =============================================================================
+#                              LICENSE (offline signed-key verification)
+# =============================================================================
+#
+# See src/license_core.py for the verification logic and license/README.md
+# for the wire format. Both endpoints require an authenticated session —
+# the license only controls which features are unlocked, it doesn't replace
+# auth.
+#
+# Feature gating itself is a follow-up commit: these endpoints expose the
+# current tier so clients (Android + native desktop) can display "Free" /
+# "Pro" in their UI without the server needing to re-verify on every RPC.
+
+@app.get("/api/license-status")
+async def api_license_status(request: Request, token: str = Query(None)):
+    """Report the currently installed license — if any.
+
+    Response shape:
+        { "active": bool, "track": str|None, "email": str|None,
+          "license_id": str|None, "issued_at": int|None }
+
+    `active=false` with everything else None means the server is at free
+    tier (no license installed, or an installed license failed to verify
+    and has been ignored). This endpoint NEVER returns 500 for a license
+    problem — license issues are never the reason the server stops
+    working.
+    """
+    if (err := _require_auth(request, token)):
+        return err
+    lic = license_core.get_active_license()
+    if lic is None:
+        return {
+            "active": False,
+            "track": None,
+            "email": None,
+            "license_id": None,
+            "issued_at": None,
+        }
+    return {
+        "active": True,
+        "track": lic.track,
+        "email": lic.email,
+        "license_id": lic.license_id,
+        "issued_at": lic.issued_at,
+    }
+
+
+@app.post("/api/license-install")
+async def api_license_install(request: Request, token: str = Query(None)):
+    """Install a new license key (body: {"key": "SKT-..."}).
+
+    Idempotent: posting the same key twice leaves the same file on disk
+    and returns the same response. Posting a DIFFERENT valid key
+    replaces the installed one atomically (tmp + fsync + os.replace, so
+    a crash mid-install doesn't corrupt the existing license)."""
+    if (err := _require_auth(request, token)):
+        return err
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    key_str = (body or {}).get("key") if isinstance(body, dict) else None
+    if not isinstance(key_str, str) or not key_str.strip():
+        return JSONResponse(
+            {"error": "body.key must be a non-empty string"}, status_code=400
+        )
+
+    try:
+        lic = license_core.install_license_key(key_str)
+    except license_core.LicenseInstallError as e:
+        # Do NOT echo the submitted key back in the error — logs only.
+        log_error(f"[License] install rejected: {e}")
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        log_error(f"[License] install failed unexpectedly: {e}")
+        return JSONResponse(
+            {"error": "license install failed"}, status_code=500
+        )
+
+    return {
+        "active": True,
+        "track": lic.track,
+        "email": lic.email,
+        "license_id": lic.license_id,
+        "issued_at": lic.issued_at,
+    }
+
+
+# =============================================================================
+#                              v1.2: VOCAB / ACCENT / HISTORY
+# =============================================================================
+#
+# All endpoints below require an authenticated session (same pattern as
+# /api/health + /api/models — _verify_session on Bearer or ?token= query).
+# They delegate to the three stores (history_db, vocab_store, accent_store)
+# and never touch inference state.
+
+def _require_auth(request: Request, token: str) -> JSONResponse | None:
+    """Shared auth check — returns a 401 response to return directly from the
+    endpoint, or None if authorized. Replaces the 2-line if-not-auth pattern
+    with a single call site."""
+    if not _verify_session(_extract_token(request, token)):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return None
+
+
+# ---------- VOCAB ----------
+
+@app.get("/api/vocab")
+async def api_vocab_get(request: Request, token: str = Query(None)):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        return vocab_store.get_default_store().get_all()
+    except Exception as e:
+        log_error(f"[Vocab] GET failed: {e}")
+        return JSONResponse({"error": "vocab read failed"}, status_code=500)
+
+
+@app.post("/api/vocab")
+async def api_vocab_replace(request: Request, token: str = Query(None)):
+    """Replace the full entries list. Body: {"entries": [...]}."""
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    entries = body.get("entries")
+    if not isinstance(entries, list):
+        return JSONResponse({"error": "body.entries must be a list"}, status_code=400)
+    try:
+        data = vocab_store.get_default_store().replace_all(entries)
+        return data
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        log_error(f"[Vocab] POST failed: {e}")
+        return JSONResponse({"error": "vocab write failed"}, status_code=500)
+
+
+@app.patch("/api/vocab")
+async def api_vocab_patch(request: Request, token: str = Query(None)):
+    """Batch add/remove. Body: {"add": [...entries], "remove": [...texts]}."""
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    add = body.get("add") or []
+    remove = body.get("remove") or []
+    if not isinstance(add, list) or not isinstance(remove, list):
+        return JSONResponse({"error": "add and remove must be lists"}, status_code=400)
+    try:
+        return vocab_store.get_default_store().patch(add=add, remove=remove)
+    except Exception as e:
+        log_error(f"[Vocab] PATCH failed: {e}")
+        return JSONResponse({"error": "vocab patch failed"}, status_code=500)
+
+
+@app.delete("/api/vocab/{text:path}")
+async def api_vocab_delete(text: str, request: Request, token: str = Query(None)):
+    """Delete a single entry by canonical text. `text:path` allows slashes/unicode."""
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        removed = vocab_store.get_default_store().remove_entry(text)
+        if not removed:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return {"status": "ok", "text": text}
+    except Exception as e:
+        log_error(f"[Vocab] DELETE failed: {e}")
+        return JSONResponse({"error": "vocab delete failed"}, status_code=500)
+
+
+# ---------- ACCENT ----------
+
+@app.post("/api/accent/calibrate")
+async def api_accent_calibrate(
+    request: Request,
+    token: str = Query(None),
+    audio: UploadFile = File(None),
+    sample_rate: int = Form(None),
+    client_name: str = Form(None),
+):
+    """Multipart audio (field name `audio`) → extract + persist profile.
+
+    Fallback: if the client POSTs a raw audio body (no multipart), read
+    request.body() and require `?sample_rate=` so we can decode PCM16.
+    """
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        if audio is not None:
+            data = await audio.read()
+            if not data:
+                return JSONResponse({"error": "empty upload"}, status_code=400)
+        else:
+            # Raw body fallback — Android may stream PCM16 directly.
+            data = await request.body()
+            if not data:
+                return JSONResponse({"error": "missing audio (multipart field or raw body)"}, status_code=400)
+            if sample_rate is None:
+                try:
+                    sample_rate = int(request.query_params.get("sample_rate", ""))
+                except ValueError:
+                    sample_rate = None
+        try:
+            meta = accent_store.get_default_store().save_profile(
+                data,
+                sample_rate=sample_rate,
+                client_name=client_name,
+            )
+        except ValueError as ve:
+            return JSONResponse({"error": str(ve)}, status_code=400)
+        return {
+            "profile_id": meta["profile_id"],
+            "dialect_estimate": meta.get("dialect_estimate", "unknown"),
+            "last_calibrated": meta["last_calibrated"],
+            "sample_count": meta["sample_count"],
+            "duration_sec": meta["duration_sec"],
+            "backend": meta["backend"],
+        }
+    except Exception as e:
+        log_error(f"[Accent] calibrate failed: {e}")
+        return JSONResponse({"error": "calibration failed"}, status_code=500)
+
+
+@app.get("/api/accent")
+async def api_accent_get(request: Request, token: str = Query(None)):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        return accent_store.get_default_store().get_metadata()
+    except Exception as e:
+        log_error(f"[Accent] GET failed: {e}")
+        return JSONResponse({"error": "accent read failed"}, status_code=500)
+
+
+@app.post("/api/accent/reset")
+async def api_accent_reset(request: Request, token: str = Query(None)):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        accent_store.get_default_store().reset()
+        return {"status": "ok"}
+    except Exception as e:
+        log_error(f"[Accent] reset failed: {e}")
+        return JSONResponse({"error": "accent reset failed"}, status_code=500)
+
+
+# ---------- HISTORY ----------
+
+@app.get("/api/history/sessions")
+async def api_history_sessions(
+    request: Request,
+    token: str = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        rows = history_db.get_default_db().list_sessions(limit=limit, offset=offset)
+        return {"sessions": rows, "limit": limit, "offset": offset}
+    except Exception as e:
+        log_error(f"[History] list_sessions failed: {e}")
+        return JSONResponse({"error": "history read failed"}, status_code=500)
+
+
+@app.get("/api/history/sessions/{session_id}")
+async def api_history_session_detail(
+    session_id: int,
+    request: Request,
+    token: str = Query(None),
+):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        s = history_db.get_default_db().get_session(session_id)
+        if s is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return s
+    except Exception as e:
+        log_error(f"[History] get_session failed: {e}")
+        return JSONResponse({"error": "history read failed"}, status_code=500)
+
+
+@app.get("/api/history/by-date/{date}")
+async def api_history_by_date(
+    date: str,
+    request: Request,
+    token: str = Query(None),
+):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        rows = history_db.get_default_db().list_by_date(date)
+        return {"date": date, "transcripts": rows}
+    except ValueError as ve:
+        return JSONResponse({"error": str(ve)}, status_code=400)
+    except Exception as e:
+        log_error(f"[History] list_by_date failed: {e}")
+        return JSONResponse({"error": "history read failed"}, status_code=500)
+
+
+@app.get("/api/history/search")
+async def api_history_search(
+    request: Request,
+    token: str = Query(None),
+    q: str = Query("", max_length=500),
+    limit: int = Query(100, ge=1, le=500),
+):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        rows = history_db.get_default_db().search(q, limit=limit)
+        return {"query": q, "results": rows, "count": len(rows)}
+    except Exception as e:
+        log_error(f"[History] search failed: {e}")
+        return JSONResponse({"error": "history search failed"}, status_code=500)
+
+
+@app.delete("/api/history/sessions/{session_id}")
+async def api_history_delete_session(
+    session_id: int,
+    request: Request,
+    token: str = Query(None),
+):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        removed = history_db.get_default_db().delete_session(session_id)
+        if removed == 0:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return {"status": "ok", "deleted_sessions": removed}
+    except Exception as e:
+        log_error(f"[History] delete_session failed: {e}")
+        return JSONResponse({"error": "history delete failed"}, status_code=500)
+
+
+@app.delete("/api/history/by-date/{date}")
+async def api_history_delete_by_date(
+    date: str,
+    request: Request,
+    token: str = Query(None),
+):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        count = history_db.get_default_db().delete_by_date(date)
+        return {"status": "ok", "deleted_transcripts": count}
+    except ValueError as ve:
+        return JSONResponse({"error": str(ve)}, status_code=400)
+    except Exception as e:
+        log_error(f"[History] delete_by_date failed: {e}")
+        return JSONResponse({"error": "history delete failed"}, status_code=500)
+
+
+@app.delete("/api/history")
+async def api_history_clear_all(request: Request, token: str = Query(None), confirm: str = Query(None)):
+    """Clear all. Requires ?confirm=yes to prevent accidental DELETE.
+
+    (Minimal confirm-token pattern from the spec — defense in depth against
+    a misbehaving client that sends DELETE /api/history without confirmation.)
+    """
+    if (err := _require_auth(request, token)):
+        return err
+    if confirm != "yes":
+        return JSONResponse({"error": "confirmation required: add ?confirm=yes"}, status_code=400)
+    try:
+        s_count, t_count = history_db.get_default_db().clear_all()
+        return {"status": "ok", "deleted_sessions": s_count, "deleted_transcripts": t_count}
+    except Exception as e:
+        log_error(f"[History] clear_all failed: {e}")
+        return JSONResponse({"error": "history clear failed"}, status_code=500)
+
+
+@app.get("/api/history/export")
+async def api_history_export(
+    request: Request,
+    token: str = Query(None),
+    fmt: str = Query("json", pattern="^(json|txt|md)$"),
+):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        db = history_db.get_default_db()
+        if fmt == "json":
+            return db.export_json()
+        if fmt == "txt":
+            return PlainTextResponse(
+                db.export_txt(),
+                headers={"Content-Disposition": 'attachment; filename="sanketra-history.txt"'},
+            )
+        # md
+        return PlainTextResponse(
+            db.export_md(),
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="sanketra-history.md"'},
+        )
+    except Exception as e:
+        log_error(f"[History] export failed: {e}")
+        return JSONResponse({"error": "history export failed"}, status_code=500)
+
+
+@app.get("/api/history/settings")
+async def api_history_settings_get(request: Request, token: str = Query(None)):
+    if (err := _require_auth(request, token)):
+        return err
+    return history_db.get_default_db().get_settings()
+
+
+@app.post("/api/history/settings")
+async def api_history_settings_set(request: Request, token: str = Query(None)):
+    if (err := _require_auth(request, token)):
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    le = body.get("logging_enabled")
+    if le is None:
+        return JSONResponse({"error": "body.logging_enabled required"}, status_code=400)
+    return history_db.get_default_db().set_settings(logging_enabled=bool(le))
+
+
+# ---------- DASHBOARD REAL-TIME WS ----------
+
+@app.websocket("/ws-dashboard")
+async def ws_dashboard(ws: WebSocket):
+    """Lightweight push channel — broadcasts {"type":"transcript", ...}
+    whenever a new final is logged.
+
+    Auth reuses the shared `_accept_authenticated_ws` helper (WebSocket
+    Subprotocol / first-message auth). This endpoint has no receive loop:
+    it's purely server→client. We keep the socket alive until the client
+    disconnects; any bytes the client sends are ignored.
+    """
+    cid = _resolve_cid(ws)
+    client_ip = ws.client.host if ws.client else "unknown"
+    if not await _accept_authenticated_ws(ws, cid, "Dashboard"):
+        return
+    # Soft cap — prevents a misconfigured browser refresh storm from leaking.
+    if len(_dashboard_ws_clients) >= _MAX_DASHBOARD_WS:
+        try:
+            await ws.close(code=4429, reason="Too many dashboards")
+        except Exception:
+            pass
+        _unregister_ws(ws)
+        return
+    _dashboard_ws_clients.add(ws)
+    _ws_log(cid, "info", f"[Dashboard] WS connected from {client_ip} (total={len(_dashboard_ws_clients)})")
+    try:
+        await ws.send_text(json.dumps({"type": "hello", "version": _SERVER_VERSION}))
+        # Passive keep-alive: just wait for disconnect. We don't need the
+        # client to say anything; any receive errors close the socket.
+        while True:
+            try:
+                await ws.receive_text()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        _dashboard_ws_clients.discard(ws)
+        _unregister_ws(ws)
+        _ws_log(cid, "info", f"[Dashboard] WS closed (remaining={len(_dashboard_ws_clients)})")
+
 
 def _do_screen_blink():
     """Cross-platform fullscreen white flash — 3 blinks, no focus steal"""
@@ -2461,1720 +4644,34 @@ def _blink_macos():
 #                              HTML/JS CLIENT
 # =============================================================================
 
-HTML_CONTENT = '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
-    <meta name="theme-color" content="#0A0A0B">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <title>Sanketra</title>
-    <style>
-        :root {
-            /* Golden Ratio Spacing — Fibonacci sequence */
-            --space-3xs: 3px; --space-2xs: 5px; --space-xs: 8px;
-            --space-sm: 13px; --space-md: 21px; --space-lg: 34px; --space-xl: 55px;
-            /* Button sizes — phi ratio 64:40 = 1.6 */
-            --btn-primary: 64px; --btn-secondary: 44px;
-            /* Typography — golden ratio scale */
-            --fs-xs: 0.65rem; --fs-sm: 0.75rem; --fs-base: 0.875rem;
-            --fs-md: 1rem; --fs-lg: 1.618rem;
-            --fw-normal: 400; --fw-medium: 500; --fw-semibold: 600;
-            --ls-normal: 0; --ls-wide: 0.02em; --ls-caps: 0.06em;
-            /* Colors — neutral grey + red recording + green accent */
-            --surface-base: #0A0A0B; --surface-raised: #141416;
-            --surface-overlay: #1C1C1F; --surface-highest: #252528;
-            --surface-sheet: #1A1A1D;
-            --text-primary: #F5F5F7; --text-secondary: #8E8E93; --text-tertiary: #7C7C82;
-            --border-subtle: rgba(255,255,255,0.06); --border-medium: rgba(255,255,255,0.12);
-            --accent: #34C759; --accent-muted: rgba(52,199,89,0.15);
-            --recording: #FF3B30; --recording-muted: rgba(255,59,48,0.15);
-            --muted-bg: #FF3B30; --muted-stripe: #F5F5F7;
-            /* Shadows */
-            --shadow-sm: none;
-            --shadow-md: none;
-            --shadow-glow-recording: 0 0 20px rgba(255,59,48,0.25), 0 0 8px rgba(255,59,48,0.15);
-            /* Animation */
-            --duration-fast: 120ms; --duration-normal: 200ms; --duration-slow: 350ms;
-            --ease-out: cubic-bezier(0.25,0.46,0.45,0.94);
-            --ease-spring: cubic-bezier(0.34,1.56,0.64,1);
-            /* Layout */
-            --key-row-height: 48px;
-            --safe-area-bottom: env(safe-area-inset-bottom, 0px);
-            --z-sticky: 50; --z-backdrop: 99; --z-sheet: 100;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, system-ui, sans-serif;
-            background: var(--surface-base);
-            color: var(--text-primary);
-            height: 100vh; height: 100dvh;
-            display: flex; flex-direction: column;
-            padding: var(--space-xs);
-            padding-top: env(safe-area-inset-top, 8px);
-            padding-bottom: env(safe-area-inset-bottom, 8px);
-            touch-action: none; user-select: none; overflow: hidden;
-            -webkit-font-smoothing: antialiased;
-        }
-        /* Controls — two-row layout */
-        .controls { flex-shrink: 0; display: flex; flex-direction: column; align-items: center; gap: var(--space-sm); padding: var(--space-xs) 0; }
-        .controls__primary { display: flex; align-items: center; justify-content: center; gap: var(--space-lg); }
-        .controls__secondary { display: flex; align-items: center; justify-content: center; gap: var(--space-md); }
-        /* Button base — aspect-ratio: 1 guarantees no ovals */
-        .ctrl-btn {
-            display: inline-flex; align-items: center; justify-content: center;
-            border: none; cursor: pointer; position: relative; overflow: hidden;
-            transition: background-color var(--duration-fast) var(--ease-out),
-                        transform var(--duration-normal) var(--ease-spring),
-                        box-shadow var(--duration-normal) var(--ease-out);
-            font-family: inherit; font-weight: var(--fw-semibold);
-            letter-spacing: var(--ls-caps); color: var(--text-primary);
-            aspect-ratio: 1; flex-shrink: 0;
-        }
-        /* --- Mic Button --- */
-        .mic-btn-wrapper { position: relative; display: flex; flex-direction: column; align-items: center; gap: var(--space-2xs); }
-        .mic-btn {
-            width: 80px; height: 80px; border-radius: 50%; background: var(--surface-overlay);
-            border: none; cursor: pointer; position: relative; display: flex; align-items: center; justify-content: center;
-            color: var(--text-primary); -webkit-tap-highlight-color: transparent; touch-action: none; z-index: 1;
-            transition: transform var(--duration-normal) var(--ease-spring),
-                        background-color var(--duration-fast) var(--ease-out),
-                        box-shadow var(--duration-normal) var(--ease-out);
-        }
-        .mic-btn__icon { display: flex; align-items: center; justify-content: center; pointer-events: none; }
-        .mic-btn__pulse { position: absolute; inset: -4px; border-radius: 50%; pointer-events: none; opacity: 0; }
-        .mic-btn__hint { font-size: var(--fs-xs); color: var(--text-tertiary); letter-spacing: var(--ls-wide); text-align: center; min-height: 1.2em; }
-        .mic-btn.holding { background: var(--recording); transform: scale(1.05); box-shadow: var(--shadow-glow-recording); }
-        .mic-btn.holding .mic-btn__pulse { opacity: 1; animation: mic-pulse-ring 1.5s var(--ease-out) infinite; }
-        .mic-btn.holding::before { content: '\2191'; position: absolute; top: -24px; font-size: var(--fs-sm); color: var(--text-tertiary); opacity: 0; animation: slide-hint 1.5s ease-in-out infinite; pointer-events: none; }
-        .mic-btn.locked { background: var(--recording); box-shadow: var(--shadow-glow-recording); }
-        .mic-btn.locked .mic-btn__pulse { opacity: 1; animation: mic-pulse-ring 1.5s var(--ease-out) infinite; }
-        .mic-btn.locked::after { content: ''; position: absolute; inset: -3px; border-radius: 50%; border: 2.5px solid var(--recording); animation: locked-ring-pulse 2s ease-in-out infinite; pointer-events: none; }
-        .mic-btn.waiting { background: var(--surface-highest); transform: scale(0.93); }
-        .mic-btn.processing { background: var(--surface-highest); pointer-events: none; opacity: 0.7; }
-        @keyframes mic-pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(255,59,48,0.45); } 70% { box-shadow: 0 0 0 14px rgba(255,59,48,0); } 100% { box-shadow: 0 0 0 0 rgba(255,59,48,0); } }
-        @keyframes locked-ring-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-        @keyframes slide-hint { 0%,100% { opacity: 0; transform: translateY(4px); } 50% { opacity: 0.6; transform: translateY(-2px); } }
-        .ctrl-btn--secondary {
-            width: var(--btn-secondary); height: var(--btn-secondary);
-            border-radius: 50%; background: var(--surface-overlay);
-            font-size: var(--fs-xs); box-shadow: var(--shadow-sm);
-        }
-        .ctrl-btn--secondary:active { transform: scale(0.88); background: var(--surface-highest); }
-        .ctrl-btn--icon-only { background: transparent; box-shadow: none; color: var(--text-secondary); }
-        .ctrl-btn--icon-only:active { background: var(--surface-overlay); color: var(--text-primary); }
-        /* Settings gear rotation */
-        #settingsBtn .ctrl-btn__icon { transition: transform var(--duration-slow) var(--ease-spring); display: inline-block; }
-        #settingsBtn.open .ctrl-btn__icon { transform: rotate(90deg); }
-        .ctrl-btn__label { font-size: inherit; pointer-events: none; line-height: 1; }
-        .ctrl-btn__icon { font-size: 1.25rem; pointer-events: none; line-height: 1; }
-        .ctrl-btn:focus-visible, .key-btn:focus-visible, .btn-done:focus-visible, .seg-control__btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-        .ctrl-btn:disabled { opacity: 0.25; cursor: not-allowed; }
-        #centerBtn:disabled { background: var(--surface-overlay); opacity: 0.25; }
-        #centerBtn:not(:disabled) { background: var(--surface-overlay); color: var(--accent); border: 1.5px solid var(--accent-muted); }
-        @keyframes center-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-        #centerBtn.sampling { animation: center-pulse 0.5s ease-in-out infinite; }
-        #centerBtn.set { color: var(--accent); }
-        /* Mic mute — CSS strikethrough, icon never changes */
-        #muteBtn { position: relative; overflow: visible; }
-        #muteBtn::after {
-            content: ''; position: absolute; top: 50%; left: 50%;
-            width: 110%; height: 2.5px; background: var(--muted-stripe);
-            border-radius: 2px; transform: translate(-50%,-50%) rotate(-45deg) scaleX(0);
-            transition: transform var(--duration-normal) var(--ease-spring),
-                        opacity var(--duration-fast) var(--ease-out);
-            opacity: 0; z-index: 1; pointer-events: none;
-        }
-        #muteBtn.muted { background: var(--muted-bg); box-shadow: 0 0 12px rgba(255,59,48,0.3); }
-        #muteBtn.muted::after { transform: translate(-50%,-50%) rotate(-45deg) scaleX(1); opacity: 1; }
-        /* Mic mute bounce */
-        @keyframes mute-bounce { 0% { transform: scale(1); } 40% { transform: scale(0.85); } 70% { transform: scale(1.08); } 100% { transform: scale(1); } }
-        #muteBtn.mute-anim { animation: mute-bounce 0.3s var(--ease-spring); }
-        /* Status & Result */
-        #status {
-            text-align: center; font-size: var(--fs-sm); font-weight: var(--fw-medium);
-            letter-spacing: var(--ls-wide); color: var(--text-secondary);
-            padding: var(--space-xs) var(--space-sm); background: var(--surface-raised);
-            border-radius: var(--space-xs); margin: var(--space-2xs) 0; flex-shrink: 0;
-            transition: color var(--duration-normal) var(--ease-out),
-                        background-color var(--duration-normal) var(--ease-out);
-            border: 1px solid var(--border-subtle);
-        }
-        #status.recording { color: var(--recording); background: var(--recording-muted); border-color: rgba(255,59,48,0.15); font-size: var(--fs-base); font-weight: 600; }
-        #status.paused { color: #CCAA33; background: rgba(204,170,51,0.1); border-color: rgba(204,170,51,0.12); }
-        #result {
-            text-align: center; font-size: var(--fs-base); color: var(--text-primary);
-            padding: var(--space-xs) var(--space-sm); max-height: 48px;
-            background: var(--surface-raised); border-radius: var(--space-xs);
-            border: 1px solid var(--border-subtle); overflow-y: auto; flex-shrink: 0;
-            scrollbar-width: thin; scrollbar-color: var(--surface-highest) transparent;
-        }
-        #result:empty { display: none; }
-        #result.partial { color: var(--text-tertiary); font-style: italic; }
-        /* Segmented control — iOS-style with sliding indicator */
-        .seg-control { flex-shrink: 0; padding: var(--space-2xs) var(--space-lg); margin: var(--space-2xs) 0; }
-        .seg-control__track {
-            display: flex; position: relative; background: var(--surface-raised);
-            border-radius: var(--space-xs); padding: var(--space-3xs);
-            border: 1px solid var(--border-subtle);
-        }
-        .seg-control__indicator {
-            position: absolute; top: var(--space-3xs); left: var(--space-3xs);
-            width: calc(50% - var(--space-3xs)); height: calc(100% - var(--space-3xs) * 2);
-            background: var(--surface-overlay); border-radius: calc(var(--space-xs) - 2px);
-            transition: transform var(--duration-slow) var(--ease-spring);
-            box-shadow: var(--shadow-sm); z-index: 0;
-        }
-        .seg-control__indicator.right { transform: translateX(100%); }
-        .seg-control__btn {
-            flex: 1; padding: var(--space-xs) 0; border: none; background: transparent;
-            color: var(--text-tertiary); font-family: inherit; font-size: var(--fs-xs);
-            font-weight: var(--fw-semibold); letter-spacing: var(--ls-caps);
-            cursor: pointer; position: relative; z-index: 1;
-            transition: color var(--duration-normal) var(--ease-out),
-                        transform var(--duration-normal) var(--ease-spring);
-            border-radius: calc(var(--space-xs) - 2px);
-        }
-        .seg-control__btn:active { transform: scale(0.93); }
-        .seg-control__btn--active { color: var(--text-primary); }
-        /* Pad */
-        #pad {
-            flex: 1; min-height: 120px; background: var(--surface-raised);
-            border-radius: var(--space-sm); margin: var(--space-xs) 0;
-            margin-bottom: calc(var(--key-row-height) + var(--space-sm) + var(--safe-area-bottom));
-            position: relative; display: flex; align-items: center; justify-content: center;
-            border: 1px solid var(--border-subtle);
-            transition: border-color var(--duration-normal) var(--ease-out),
-                        background-color var(--duration-normal) var(--ease-out);
-        }
-        #pad.touching { border-color: var(--border-medium); background: #161618; }
-        #pad::after { content: attr(data-label); color: var(--text-tertiary); font-size: var(--fs-lg); font-weight: var(--fw-semibold); letter-spacing: var(--ls-caps); pointer-events: none; opacity: 0.4; }
-        /* Key row */
-        .key-row {
-            display: flex; gap: var(--space-xs); padding: var(--space-xs) var(--space-sm);
-            padding-bottom: calc(var(--space-xs) + var(--safe-area-bottom));
-            justify-content: center; position: fixed; bottom: 0; left: 0; right: 0;
-            background: var(--surface-base); z-index: var(--z-sticky);
-            border-top: 1px solid var(--border-subtle);
-        }
-        .key-btn {
-            flex: 1; max-width: 160px; height: var(--key-row-height);
-            border: none; border-radius: var(--space-xs);
-            background: var(--surface-overlay); color: var(--text-primary);
-            font-family: inherit; font-size: var(--fs-base); font-weight: var(--fw-medium);
-            cursor: pointer;
-            transition: background-color var(--duration-fast) var(--ease-out),
-                        transform var(--duration-normal) var(--ease-spring);
-        }
-        .key-btn:active { background: var(--surface-highest); transform: scale(0.94); }
-        .key-btn.active { background: rgba(52,199,89,0.08); }
-        /* Settings sheet */
-        .settings-backdrop {
-            position: fixed; inset: 0; background: rgba(0,0,0,0.5);
-            backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
-            z-index: var(--z-backdrop); opacity: 0; pointer-events: none;
-            transition: opacity var(--duration-slow) var(--ease-out);
-        }
-        .settings-backdrop.open { opacity: 1; pointer-events: auto; }
-        .settings-sheet {
-            position: fixed; bottom: 0; left: 0; width: 100%; max-height: 70vh;
-            background: var(--surface-sheet); border-radius: var(--space-md) var(--space-md) 0 0;
-            padding: var(--space-sm) var(--space-md);
-            padding-bottom: calc(var(--space-md) + var(--safe-area-bottom));
-            z-index: var(--z-sheet); transform: translateY(100%);
-            transition: transform var(--duration-slow) var(--ease-spring);
-            overflow-y: auto; border-top: 1px solid var(--border-medium);
-        }
-        .settings-sheet.open { transform: translateY(0); }
-        .sheet-handle { width: 36px; height: 4px; background: var(--text-tertiary); border-radius: 2px; margin: 0 auto var(--space-md); opacity: 0.6; }
-        .setting-row { display: flex; align-items: center; justify-content: space-between; padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-subtle); gap: var(--space-sm); }
-        .setting-row:last-of-type { border-bottom: none; }
-        .setting-row label { font-size: var(--fs-base); font-weight: var(--fw-medium); color: var(--text-primary); flex-shrink: 0; }
-        .setting-row input[type=range] { width: 140px; height: 4px; -webkit-appearance: none; appearance: none; background: var(--surface-highest); border-radius: 2px; outline: none; }
-        .setting-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%; background: var(--text-primary); cursor: pointer; box-shadow: var(--shadow-md); transition: transform var(--duration-normal) var(--ease-spring), box-shadow var(--duration-normal) var(--ease-out); }
-        .setting-row input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 0 12px rgba(245,245,247,0.25); }
-        .setting-row input[type=range]::-moz-range-track { height: 4px; background: var(--surface-highest); border-radius: 2px; border: none; }
-        .setting-row input[type=range]::-moz-range-thumb { width: 22px; height: 22px; border-radius: 50%; background: var(--text-primary); cursor: pointer; box-shadow: var(--shadow-md); border: none; }
-        .setting-row span { width: 40px; text-align: right; font-size: var(--fs-sm); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
-        .setting-row select { padding: var(--space-xs) var(--space-sm); border-radius: var(--space-xs); border: 1px solid var(--border-medium); background: var(--surface-highest); color: var(--text-primary); font-family: inherit; font-size: var(--fs-sm); -webkit-appearance: none; appearance: none; transition: border-color var(--duration-normal) var(--ease-out), box-shadow var(--duration-normal) var(--ease-out); outline: none; }
-        .setting-row select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-muted); }
-        .btn-done { width: 100%; padding: var(--space-sm); margin-top: var(--space-md); background: var(--surface-overlay); border: 1px solid var(--border-medium); border-radius: var(--space-xs); color: var(--text-primary); font-family: inherit; font-size: var(--fs-md); font-weight: var(--fw-semibold); letter-spacing: var(--ls-wide); cursor: pointer; transition: background-color var(--duration-fast) var(--ease-out), transform var(--duration-normal) var(--ease-spring); }
-        .btn-done:active { background: var(--surface-highest); transform: scale(0.96); }
-        .btn-done--flush { margin-top: 0; }
-        /* Calibration status */
-        .calib-status { font-size: var(--fs-sm); color: var(--text-tertiary); margin-top: var(--space-2xs); text-align: center; transition: color var(--duration-normal) var(--ease-out); }
-        .calib-status.set { color: var(--accent); }
-        /* Recording pulse animation */
-        @keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(255,59,48,0.4); } 70% { box-shadow: 0 0 0 10px rgba(255,59,48,0); } 100% { box-shadow: 0 0 0 0 rgba(255,59,48,0); } }
-        @media (prefers-reduced-motion: reduce) { .mic-btn.holding .mic-btn__pulse, .mic-btn.locked .mic-btn__pulse, .mic-btn.locked::after, .mic-btn.holding::before, #muteBtn.mute-anim, #centerBtn.sampling { animation: none; } .mic-btn.waiting { transform: none; } }
-        /* Welcome overlay */
-        .welcome { position: fixed; inset: 0; z-index: 200; background: var(--surface-base); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--space-lg); padding: var(--space-xl); text-align: center; transition: opacity var(--duration-slow) var(--ease-out); }
-        .welcome.fade-out { opacity: 0; pointer-events: none; }
-        .welcome h1 { font-size: 1.8rem; font-weight: var(--fw-semibold); letter-spacing: var(--ls-wide); color: var(--text-primary); }
-        .welcome p { font-size: var(--fs-base); color: var(--text-secondary); line-height: 1.6; max-width: 280px; }
-        .welcome button { margin-top: var(--space-md); padding: var(--space-xs) var(--space-xl); font-size: var(--fs-base); font-weight: var(--fw-semibold); color: #fff; background: var(--accent); border: none; border-radius: 999px; cursor: pointer; letter-spacing: var(--ls-wide); transition: transform var(--duration-fast) var(--ease-spring), opacity var(--duration-fast); }
-        .welcome button:active { transform: scale(0.95); opacity: 0.85; }
-        /* Screen mirror overlay */
-        .screen-overlay { position: fixed; inset: 0; z-index: 250; background: #000; display: none; flex-direction: column; }
-        .screen-overlay.active { display: flex; }
-        .screen-overlay canvas { flex: 1; width: 100%; height: 100%; object-fit: contain; }
-        .screen-overlay__bar { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; justify-content: space-between; padding: var(--space-xs) var(--space-sm); background: rgba(0,0,0,0.6); z-index: 251; }
-        .screen-overlay__bar button { background: var(--surface-overlay); color: var(--text-primary); border: none; border-radius: 8px; padding: var(--space-2xs) var(--space-sm); font-size: var(--fs-sm); cursor: pointer; }
-        .screen-overlay__bar span { color: var(--text-secondary); font-size: var(--fs-xs); font-family: monospace; }
-    </style>
-</head>
-<body>
-    <div class="controls">
-        <div class="controls__primary">
-            <div class="mic-btn-wrapper">
-                <button class="mic-btn" id="micBtn" aria-label="Record audio">
-                    <span class="mic-btn__pulse"></span>
-                    <span class="mic-btn__icon mic-btn__icon--mic">
-                        <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
-                    </span>
-                    <span class="mic-btn__icon mic-btn__icon--lock" style="display:none">
-                        <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/></svg>
-                    </span>
-                </button>
-                <span class="mic-btn__hint" id="micHint"></span>
-            </div>
-        </div>
-        <div class="controls__secondary">
-            <button class="ctrl-btn ctrl-btn--secondary" id="muteBtn" aria-label="Mute microphone">
-                <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" style="pointer-events:none"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
-            </button>
-            <button class="ctrl-btn ctrl-btn--secondary" id="centerBtn" disabled aria-label="Set gyro center">
-                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="pointer-events:none"><circle cx="12" cy="12" r="3"/><line x1="12" y1="2" x2="12" y2="7"/><line x1="12" y1="17" x2="12" y2="22"/><line x1="2" y1="12" x2="7" y2="12"/><line x1="17" y1="12" x2="22" y2="12"/></svg>
-            </button>
-            <button class="ctrl-btn ctrl-btn--secondary" id="screenBtn" aria-label="Screen mirror">
-                <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" style="pointer-events:none"><path d="M21 2H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7v2H8v2h8v-2h-2v-2h7c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H3V4h18v12z"/></svg>
-            </button>
-            <button class="ctrl-btn ctrl-btn--secondary ctrl-btn--icon-only" id="settingsBtn" aria-label="Settings">
-                <span class="ctrl-btn__icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1112 8.4a3.6 3.6 0 010 7.2z"/></svg></span>
-            </button>
-        </div>
-    </div>
-    <div id="status" aria-live="polite">Loading...</div>
-    <div id="result" aria-live="polite"></div>
-    <div class="seg-control" id="modeToggle" role="tablist" aria-label="Input mode">
-        <div class="seg-control__track">
-            <div class="seg-control__indicator" id="segIndicator"></div>
-            <button class="seg-control__btn seg-control__btn--active" id="modeTrackpad" role="tab" aria-selected="true">TRACKPAD</button>
-            <button class="seg-control__btn" id="modeGyro" role="tab" aria-selected="false">GYROSCOPE</button>
-        </div>
-    </div>
-    <div id="pad" data-label="TRACKPAD"></div>
-    <div class="key-row">
-        <button class="key-btn" id="backspaceBtn" aria-label="Backspace">⌫ Backspace</button>
-        <button class="key-btn" id="enterBtn" aria-label="Enter">Enter ↵</button>
-    </div>
-    <div class="settings-backdrop" id="settingsBackdrop"></div>
-    <div class="settings-sheet" id="settingsSheet" role="dialog" aria-modal="true" aria-label="Settings">
-        <div class="sheet-handle"></div>
-        <div class="setting-row">
-            <label>Trackpad Speed</label>
-            <input type="range" min="0.5" max="4" step="0.25" value="1.5" id="sensitivitySlider">
-            <span id="sensitivityVal">1.5x</span>
-        </div>
-        <!-- Input Mode selector removed: use main screen segmented control -->
-        <div id="gyroSettings" style="display: none;">
-            <div class="setting-row">
-                <label>Gyro Sensitivity</label>
-                <input type="range" min="1" max="10" step="0.5" value="3" id="gyroSensitivity">
-                <span id="gyroSensVal">3x</span>
-            </div>
-            <div class="setting-row">
-                <button id="calibrateBtn" class="btn-done btn-done--flush">
-                    Set Center
-                </button>
-            </div>
-            <div id="calibStatus" class="calib-status">
-                Not calibrated
-            </div>
-            <div class="setting-row" style="margin-top: var(--space-xs);">
-                <label for="autoSwitchChk" style="flex:1; cursor:pointer;">Auto-switch to Trackpad on mouse</label>
-                <input type="checkbox" id="autoSwitchChk" checked style="width:18px; height:18px; accent-color:var(--accent); cursor:pointer;">
-            </div>
-        </div>
-        <button class="btn-done" id="settingsDone">Done</button>
-    </div>
-
-    <div class="screen-overlay" id="screenOverlay">
-        <div class="screen-overlay__bar">
-            <button id="screenBackBtn">Back</button>
-            <select id="screenRes" style="background:var(--surface-overlay);color:var(--text-primary);border:none;border-radius:8px;padding:4px 8px;font-size:var(--fs-xs);">
-                <option value="">Native</option>
-                <option value="1080p" selected>1080p</option>
-                <option value="720p">720p</option>
-                <option value="480p">480p</option>
-            </select>
-            <span id="screenFps">--</span>
-        </div>
-        <canvas id="screenCanvas"></canvas>
-    </div>
-
-    <div class="welcome" id="welcome">
-        <h1>Sanketra</h1>
-        <p>Turn your phone into a wireless mic &amp; trackpad. Speak to type. Swipe to move cursor.</p>
-        <button id="welcomeBtn">Get Started</button>
-    </div>
-
-    <script>
-        // Auth token from URL (passed via QR code)
-        const _wsToken = new URLSearchParams(location.search).get('token') || '';
-
-        // Welcome overlay
-        const welcomeEl = document.getElementById('welcome');
-        const dismissWelcome = () => { welcomeEl.classList.add('fade-out'); setTimeout(() => welcomeEl.style.display = 'none', 350); };
-        document.getElementById('welcomeBtn').addEventListener('click', dismissWelcome);
-        welcomeEl.addEventListener('click', (e) => { if (e.target === welcomeEl) dismissWelcome(); });
-
-        // Protocol constants
-        const MSG_AUDIO_FRAME = 0x01;
-        const MSG_START_SESSION = 0x10;
-        const MSG_END_SESSION = 0x11;
-        const MSG_FINAL = 0x02;
-        const MSG_VAD_STATUS = 0x03;
-        const MSG_PARTIAL = 0x04;
-        const MSG_BACKPRESSURE = 0xFE;
-        const MSG_SESSION_READY = 0xF0;
-        const MSG_SESSION_DONE = 0xF1;
-        const MSG_INPUT_PAUSED = 0xF2;
-        const MSG_INPUT_RESUMED = 0xF3;
-        const MSG_ERROR = 0xFF;
-
-        const pad = document.getElementById('pad');
-        const micBtn = document.getElementById('micBtn');
-        const micHint = document.getElementById('micHint');
-        const micIconMic = micBtn.querySelector('.mic-btn__icon--mic');
-        const micIconLock = micBtn.querySelector('.mic-btn__icon--lock');
-        const muteBtn = document.getElementById('muteBtn');
-        const status = document.getElementById('status');
-        const result = document.getElementById('result');
-        const settingsBtn = document.getElementById('settingsBtn');
-        const centerBtn = document.getElementById('centerBtn');
-        const modeTrackpadBtn = document.getElementById('modeTrackpad');
-        const modeGyroBtn = document.getElementById('modeGyro');
-        const settingsSheet = document.getElementById('settingsSheet');
-        const sensitivitySlider = document.getElementById('sensitivitySlider');
-        const sensitivityVal = document.getElementById('sensitivityVal');
-        const settingsDone = document.getElementById('settingsDone');
-
-        // ===== SETTINGS =====
-        let sensitivity = parseFloat(localStorage.getItem('tpSensitivity') || '1.5');
-        sensitivitySlider.value = sensitivity;
-        sensitivityVal.textContent = sensitivity + 'x';
-
-        const settingsBackdrop = document.getElementById('settingsBackdrop');
-        function openSettings() { haptic(); settingsSheet.classList.add('open'); settingsBackdrop.classList.add('open'); settingsBtn.classList.add('open'); settingsDone.focus(); }
-        function closeSettings() { haptic(); settingsSheet.classList.remove('open'); settingsBackdrop.classList.remove('open'); settingsBtn.classList.remove('open'); settingsBtn.focus(); }
-        settingsBtn.onclick = openSettings;
-        settingsDone.onclick = closeSettings;
-        settingsBackdrop.onclick = closeSettings;
-        // Focus trap inside settings dialog
-        settingsSheet.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') { closeSettings(); return; }
-            if (e.key !== 'Tab') return;
-            const focusable = settingsSheet.querySelectorAll('button, input, select, [tabindex]:not([tabindex="-1"])');
-            if (!focusable.length) return;
-            const first = focusable[0], last = focusable[focusable.length - 1];
-            if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
-            else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
-        });
-
-        // Center button — set gyro center (debounced 600ms)
-        let _centerDebounce = 0;
-        centerBtn.ontouchstart = async (e) => {
-            e.preventDefault();
-            if (inputMode !== 'gyro') return;
-            const now = Date.now();
-            if (now - _centerDebounce < 600) return;
-            _centerDebounce = now;
-            const hasPermission = await requestGyroPermission();
-            if (!hasPermission) return;
-            haptic();
-            centerBtn.classList.add('sampling');
-            await fetchScreenSize();
-            const samples = [];
-            const interval = setInterval(() => samples.push({...currentOrientation}), 50);
-            setTimeout(() => {
-                clearInterval(interval);
-                if (samples.length === 0) samples.push({...currentOrientation});
-                gyroCenter = {
-                    alpha: samples.reduce((s, o) => s + o.alpha, 0) / samples.length,
-                    beta: samples.reduce((s, o) => s + o.beta, 0) / samples.length,
-                };
-                localStorage.setItem('gyroCenter', JSON.stringify(gyroCenter));
-                window.gyroLastPos = {x: screenSize.w / 2, y: screenSize.h / 2};
-                centerBtn.classList.remove('sampling');
-                centerBtn.classList.add('set');
-                updateCalibStatus();
-                status.textContent = 'Center set!';
-            }, 500);
-        };
-        sensitivitySlider.oninput = () => {
-            sensitivity = parseFloat(sensitivitySlider.value);
-            sensitivityVal.textContent = sensitivity + 'x';
-            localStorage.setItem('tpSensitivity', sensitivity);
-        };
-
-        // ===== GYROSCOPE MODE =====
-        let inputMode = localStorage.getItem('inputMode') || 'trackpad';
-        let gyroSensitivity = parseFloat(localStorage.getItem('gyroSensitivity') || '3');
-        let gyroCenter = JSON.parse(localStorage.getItem('gyroCenter') || 'null');
-        let gyroAutoSwitch = localStorage.getItem('gyroAutoSwitch') !== 'false';
-        const autoSwitchChk = document.getElementById('autoSwitchChk');
-        autoSwitchChk.checked = gyroAutoSwitch;
-        autoSwitchChk.addEventListener('change', () => { gyroAutoSwitch = autoSwitchChk.checked; localStorage.setItem('gyroAutoSwitch', gyroAutoSwitch); });
-        // Discard old center format (had gamma, needs alpha)
-        if (gyroCenter && gyroCenter.alpha === undefined) {
-            gyroCenter = null;
-            localStorage.removeItem('gyroCenter');
-        }
-        let screenSize = {w: 1920, h: 1080};
-        let currentOrientation = {alpha: 0, beta: 0, gamma: 0};
-        let lastGyroUpdate = 0;
-        const GYRO_UPDATE_INTERVAL = 16; // ~60fps
-
-        const inputModeSelect = document.getElementById('inputMode');
-        const gyroSettings = document.getElementById('gyroSettings');
-        const gyroSensSlider = document.getElementById('gyroSensitivity');
-        const gyroSensVal = document.getElementById('gyroSensVal');
-        const calibrateBtn = document.getElementById('calibrateBtn');
-        let edgeHitStart = 0;
-
-        async function fetchScreenSize() {
-            try {
-                const resp = await fetch('/api/screen', {
-                    headers: {'Authorization': 'Bearer ' + _wsToken}
-                });
-                const data = await resp.json();
-                screenSize = {w: data.w, h: data.h};
-            } catch (e) {
-                console.warn('Could not fetch screen size, using 1920x1080');
-            }
-        }
-
-        // Initialize UI
-        if (inputModeSelect) inputModeSelect.value = inputMode;
-        gyroSensSlider.value = gyroSensitivity;
-        gyroSensVal.textContent = gyroSensitivity + 'x';
-        gyroSettings.style.display = (inputMode === 'gyro') ? 'block' : 'none';
-        updateUIMode();
-        if (inputMode === 'gyro') { fetchScreenSize(); requestGyroPermission(); }
-
-        // Lock to portrait (prevents chaos in gyro mode)
-        try { screen.orientation.lock('portrait').catch(() => {}); } catch(e) {}
-
-        // Mode switching — settings dropdown and main toggle both use switchMode()
-        if (inputModeSelect) inputModeSelect.onchange = () => { switchMode(inputModeSelect.value); };
-        modeTrackpadBtn.onclick = () => { haptic(); switchMode('trackpad'); };
-        modeGyroBtn.onclick = () => { haptic(); switchMode('gyro'); };
-
-        gyroSensSlider.oninput = () => {
-            gyroSensitivity = parseFloat(gyroSensSlider.value);
-            gyroSensVal.textContent = gyroSensitivity + 'x';
-            localStorage.setItem('gyroSensitivity', gyroSensitivity);
-        };
-
-        function updateUIMode() {
-            const isGyro = inputMode === 'gyro';
-            centerBtn.disabled = !isGyro;
-            // Segmented control — slide indicator pill
-            const indicator = document.getElementById('segIndicator');
-            if (indicator) indicator.classList.toggle('right', isGyro);
-            modeTrackpadBtn.classList.toggle('seg-control__btn--active', !isGyro);
-            modeGyroBtn.classList.toggle('seg-control__btn--active', isGyro);
-            modeTrackpadBtn.setAttribute('aria-selected', String(!isGyro));
-            modeGyroBtn.setAttribute('aria-selected', String(isGyro));
-            pad.dataset.label = isGyro ? 'GYRO POINTER' : 'TRACKPAD';
-        }
-
-        function switchMode(newMode) {
-            if (inputMode === newMode) return;
-            // Force-cleanup stuck gesture state
-            _cancelBufferedClick();
-            if (scrolling) { scrolling = false; sendTp({t: 'ss'}); }
-            if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = null; }
-            if (dragging) { dragging = false; sendTp({t: 'd', a: 'up'}); }
-            moved = false;
-            fingerCount = 0;
-            totalDist = 0;
-            scrollVelocity = 0;
-            lastScrollTime = 0;
-
-            inputMode = newMode;
-            localStorage.setItem('inputMode', inputMode);
-            if (inputModeSelect) inputModeSelect.value = inputMode;
-            gyroSettings.style.display = (inputMode === 'gyro') ? 'block' : 'none';
-            updateUIMode();
-            if (inputMode === 'gyro') {
-                requestGyroPermission();
-                fetchScreenSize();
-                updateCalibStatus();
-            } else {
-                if (!tpConnected) connectTrackpad();
-            }
-        }
-
-        // iOS Permission Handling
-        async function requestGyroPermission() {
-            if (!window.DeviceOrientationEvent) {
-                status.textContent = 'Gyroscope not supported';
-                return false;
-            }
-            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
-                try {
-                    const permission = await DeviceOrientationEvent.requestPermission();
-                    if (permission === 'granted') {
-                        window.addEventListener('deviceorientation', handleDeviceOrientation);
-                        console.log('Gyro permission granted');
-                        return true;
-                    } else {
-                        status.textContent = 'Gyro permission denied';
-                        return false;
-                    }
-                } catch (err) {
-                    console.error('Permission error:', err);
-                    status.textContent = 'Gyro permission error';
-                    return false;
-                }
-            } else {
-                window.addEventListener('deviceorientation', handleDeviceOrientation);
-                console.log('Gyro activated');
-                return true;
-            }
-        }
-
-        function handleDeviceOrientation(event) {
-            currentOrientation = {
-                alpha: event.alpha || 0,
-                beta: event.beta || 0,
-                gamma: event.gamma || 0
-            };
-            if (inputMode === 'gyro' && gyroCenter && tpConnected) {
-                updateCursorFromGyro();
-            }
-        }
-
-        // Set Center — capture current phone orientation as screen center
-        let _calibDebounce = 0;
-        calibrateBtn.onclick = async () => {
-            const now = Date.now();
-            if (now - _calibDebounce < 600) return;
-            _calibDebounce = now;
-            const hasPermission = await requestGyroPermission();
-            if (!hasPermission) return;
-            haptic();
-            calibrateBtn.textContent = 'Sampling...';
-            calibrateBtn.style.opacity = '0.5';
-            await fetchScreenSize();
-            const samples = [];
-            const interval = setInterval(() => samples.push({...currentOrientation}), 50);
-            setTimeout(() => {
-                clearInterval(interval);
-                if (samples.length === 0) samples.push({...currentOrientation});
-                gyroCenter = {
-                    alpha: samples.reduce((s, o) => s + o.alpha, 0) / samples.length,
-                    beta: samples.reduce((s, o) => s + o.beta, 0) / samples.length,
-                };
-                localStorage.setItem('gyroCenter', JSON.stringify(gyroCenter));
-                window.gyroLastPos = {x: screenSize.w / 2, y: screenSize.h / 2};
-                calibrateBtn.textContent = 'Set Center';
-                calibrateBtn.style.opacity = '1';
-                updateCalibStatus();
-                status.textContent = 'Center set!';
-            }, 500);
-        };
-
-        // Helper functions
-        function normalizeAngle(angle) {
-            while (angle > 180) angle -= 360;
-            while (angle < -180) angle += 360;
-            return angle;
-        }
-
-        function updateCursorFromGyro() {
-            const now = Date.now();
-            if (now - lastGyroUpdate < GYRO_UPDATE_INTERVAL) return;
-            lastGyroUpdate = now;
-
-            // Direct mapping: orientation delta → screen pixels
-            // alpha (yaw) → X axis, beta (pitch) → Y axis
-            const pxPerDeg = gyroSensitivity * 20;
-            let da = currentOrientation.alpha - gyroCenter.alpha;
-            // Handle alpha wrapping (0↔360 boundary)
-            if (da > 180) da -= 360;
-            if (da < -180) da += 360;
-            const db = currentOrientation.beta - gyroCenter.beta;
-
-            let x = screenSize.w / 2 + da * pxPerDeg;
-            let y = screenSize.h / 2 + db * pxPerDeg;
-
-            // Clamp to screen bounds
-            x = Math.max(0, Math.min(screenSize.w, x));
-            y = Math.max(0, Math.min(screenSize.h, y));
-
-            // Adaptive smoothing — fast move = responsive, still = stable
-            if (!window.gyroLastPos) window.gyroLastPos = {x, y};
-            const dx = x - window.gyroLastPos.x;
-            const dy = y - window.gyroLastPos.y;
-            const speed = Math.sqrt(dx * dx + dy * dy);
-            const alpha = Math.min(0.85, Math.max(0.3, speed / 60));
-            const smoothX = (1 - alpha) * window.gyroLastPos.x + alpha * x;
-            const smoothY = (1 - alpha) * window.gyroLastPos.y + alpha * y;
-            window.gyroLastPos = {x: smoothX, y: smoothY};
-
-            // Send ABSOLUTE position
-            if (tpConnected) {
-                sendTp({t: 'a', x: Math.round(smoothX), y: Math.round(smoothY)});
-            }
-
-            // Auto-recenter: if stuck at edge for >2s
-            checkEdgeRecenter(smoothX, smoothY, screenSize.w, screenSize.h);
-        }
-
-        function checkEdgeRecenter(x, y, sw, sh) {
-            const margin = 20;
-            const atEdge = x <= margin || x >= sw - margin || y <= margin || y >= sh - margin;
-            if (atEdge) {
-                if (!edgeHitStart) edgeHitStart = Date.now();
-                if (Date.now() - edgeHitStart > 2000) {
-                    // Auto-recenter: re-capture current orientation as center
-                    gyroCenter = {
-                        alpha: currentOrientation.alpha,
-                        beta: currentOrientation.beta,
-                    };
-                    localStorage.setItem('gyroCenter', JSON.stringify(gyroCenter));
-                    window.gyroLastPos = {x: sw / 2, y: sh / 2};
-                    sendTp({t: 'rc'});
-                    edgeHitStart = 0;
-                }
-            } else {
-                edgeHitStart = 0;
-            }
-        }
-
-        function updateCalibStatus() {
-            const statusEl = document.getElementById('calibStatus');
-            if (gyroCenter) {
-                statusEl.textContent = 'Center set — point and move';
-                statusEl.classList.add('set');
-            } else {
-                statusEl.textContent = 'Point at screen center, then Set Center';
-                statusEl.classList.remove('set');
-            }
-        }
-
-
-        // ===== TRACKPAD =====
-        let tpWs = null;
-        let lastX = 0, lastY = 0;
-        let tpConnected = false;
-        let touchStart = 0;
-        let moved = false;
-        let fingerCount = 0;
-        let lastTap = 0;
-        let dragging = false;
-        let scrolling = false;
-        let scrollAccum = 0;
-        let scrollRaf = null;
-        // Momentum scrolling state
-        let scrollVelocity = 0;
-        let lastScrollTime = 0;
-        let momentumRaf = null;
-        const SCROLL_FRICTION = 0.95;      // per-frame damping (time constant ~325ms)
-        const SCROLL_MIN_VELOCITY = 0.3;   // stop threshold (sub-pixel)
-
-        let _tpReconnectTimer = null;
-        function connectTrackpad() {
-            // Skip only if WS is already open or connecting
-            if (tpWs && (tpWs.readyState === WebSocket.OPEN || tpWs.readyState === WebSocket.CONNECTING)) return;
-            // Clean up stale reference (CLOSING or CLOSED state)
-            if (tpWs) { tpWs = null; tpConnected = false; }
-            tpWs = new WebSocket('wss://' + location.host + '/ws-tp');
-            tpWs.onopen = () => {
-                tpWs.send(JSON.stringify({t:'auth',token:_wsToken}));
-                tpConnected = true; console.log('Trackpad connected');
-            };
-            tpWs.onclose = (e) => {
-                tpWs = null; tpConnected = false;
-                if (e.code === 4401) {
-                    console.warn('Trackpad WS: session expired (4401)');
-                    status.textContent = 'Session expired \u2014 refresh page';
-                    return;
-                }
-                // Auto-reconnect after 500ms if not already scheduled
-                if (!_tpReconnectTimer) {
-                    _tpReconnectTimer = setTimeout(() => { _tpReconnectTimer = null; connectTrackpad(); }, 500);
-                }
-            };
-            tpWs.onerror = () => { console.error('Trackpad WS error'); };
-            tpWs.binaryType = 'arraybuffer';
-            tpWs.onmessage = (e) => {
-                const data = new Uint8Array(e.data);
-                const type = data[0];
-                if (type === MSG_INPUT_PAUSED) {
-                    if (gyroAutoSwitch && inputMode === 'gyro') switchMode('trackpad');
-                    status.textContent = 'Paused \u2014 laptop input active';
-                    status.classList.add('paused');
-                    status.classList.remove('recording');
-                } else if (type === MSG_INPUT_RESUMED) {
-                    status.textContent = sessionActive ? 'Listening...' : 'Ready';
-                    status.classList.remove('paused');
-                    if (sessionActive) status.classList.add('recording');
-                }
-            };
-        }
-
-        function sendTp(obj) {
-            if (tpConnected && tpWs?.readyState === 1) {
-                tpWs.send(JSON.stringify(obj));
-            } else {
-                // WS dead — trigger reconnect and queue the message for retry
-                connectTrackpad();
-            }
-        }
-
-        connectTrackpad();
-
-        // Movement threshold (px) — finger jitter below this doesn't count as "moved"
-        const MOVE_THRESHOLD = 8;
-        const LONG_PRESS_MS = 300;
-        const DOUBLE_TAP_WINDOW = 300;  // ms to wait before sending buffered click
-        let startX = 0, startY = 0;
-        let totalDist = 0;
-        let longPressTimer = null;
-        let longPressFired = false;
-        // Double-tap-drag buffering (P1-10): buffer click on first tap,
-        // cancel it if second tap arrives within DOUBLE_TAP_WINDOW to start drag instead.
-        let _bufferedClickTimer = null;
-        let _bufferedClickBtn = 1;
-
-        function _flushBufferedClick() {
-            if (_bufferedClickTimer) {
-                clearTimeout(_bufferedClickTimer);
-                _bufferedClickTimer = null;
-                sendTp({t: 'c', b: _bufferedClickBtn});
-            }
-        }
-
-        function _cancelBufferedClick() {
-            if (_bufferedClickTimer) {
-                clearTimeout(_bufferedClickTimer);
-                _bufferedClickTimer = null;
-            }
-        }
-
-        function onTouchStart(e) {
-            e.preventDefault();
-            e.currentTarget.classList.add('touching');
-            if (!tpConnected) connectTrackpad();
-            const now = Date.now();
-            fingerCount = e.touches.length;
-            lastX = e.touches[0].clientX;
-            lastY = e.touches[0].clientY;
-
-            if (fingerCount === e.changedTouches.length) {
-                if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = null; sendTp({t: 'ss'}); }
-                touchStart = now;
-                moved = false;
-                totalDist = 0;
-                longPressFired = false;
-                startX = lastX;
-                startY = lastY;
-
-                // Double-tap-drag: if there's a buffered click pending and second tap arrives,
-                // cancel the buffered click and start drag instead (no click sent to desktop)
-                if (fingerCount === 1 && _bufferedClickTimer && !dragging) {
-                    _cancelBufferedClick();
-                    dragging = true;
-                    sendTp({t: 'd', a: 'down'});
-                }
-                lastTap = now;
-
-                // Long press = right click (single finger, no drag)
-                if (longPressTimer) clearTimeout(longPressTimer);
-                if (fingerCount === 1 && !dragging) {
-                    longPressTimer = setTimeout(() => {
-                        longPressTimer = null;
-                        if (!moved && !dragging && !scrolling) {
-                            longPressFired = true;
-                            _cancelBufferedClick();
-                            sendTp({t: 'c', b: 3});
-                            if (typeof haptic === 'function') haptic();
-                        }
-                    }, LONG_PRESS_MS);
-                }
-            }
-        }
-        pad.addEventListener('touchstart', onTouchStart, {passive: false});
-
-        function onTouchMove(e) {
-            e.preventDefault();
-            fingerCount = e.touches.length;
-            const t = e.touches[0];
-            const dx = t.clientX - lastX;
-            const dy = t.clientY - lastY;
-            lastX = t.clientX;
-            lastY = t.clientY;
-            totalDist += Math.abs(dx) + Math.abs(dy);
-
-            if (totalDist > MOVE_THRESHOLD) {
-                moved = true;
-                if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
-            }
-
-            if (fingerCount >= 2 && !dragging) {
-                scrolling = true;
-                if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = null; }
-                const now = performance.now();
-                const scrollDy = dy * sensitivity;
-                if (lastScrollTime > 0) {
-                    const dt = now - lastScrollTime;
-                    if (dt > 0 && dt < 100) scrollVelocity = scrollDy / dt * 16.67;
-                }
-                lastScrollTime = now;
-                scrollAccum += scrollDy;
-                if (!scrollRaf) {
-                    scrollRaf = requestAnimationFrame(() => {
-                        scrollRaf = null;
-                        if (scrollAccum !== 0) {
-                            sendTp({t: 's', dy: scrollAccum});
-                            scrollAccum = 0;
-                        }
-                    });
-                }
-            } else if (fingerCount === 1 && inputMode !== 'gyro') {
-                sendTp({t: 'm', x: dx * sensitivity, y: dy * sensitivity});
-            }
-        }
-        pad.addEventListener('touchmove', onTouchMove, {passive: false});
-
-        function onTouchEnd(e) {
-            e.preventDefault();
-            const remaining = e.touches.length;
-            if (remaining > 0) return;
-            e.currentTarget.classList.remove('touching');
-
-            if (scrolling) {
-                scrolling = false;
-                if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = null; }
-                if (scrollAccum !== 0) sendTp({t: 's', dy: scrollAccum});
-                scrollAccum = 0;
-                if (Math.abs(scrollVelocity) > SCROLL_MIN_VELOCITY) {
-                    let vel = scrollVelocity;
-                    const momentumTick = () => {
-                        vel *= SCROLL_FRICTION;
-                        if (Math.abs(vel) < SCROLL_MIN_VELOCITY) { momentumRaf = null; sendTp({t: 'ss'}); return; }
-                        sendTp({t: 's', dy: vel});
-                        momentumRaf = requestAnimationFrame(momentumTick);
-                    };
-                    momentumRaf = requestAnimationFrame(momentumTick);
-                } else {
-                    sendTp({t: 'ss'});
-                }
-                scrollVelocity = 0;
-                lastScrollTime = 0;
-            }
-            if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
-            if (dragging) { dragging = false; sendTp({t: 'd', a: 'up'}); }
-            else if (!longPressFired && !moved && Date.now() - touchStart < 300) {
-                // P1-10: Buffer the click for DOUBLE_TAP_WINDOW ms.
-                // If a second tap arrives within the window, it becomes a drag (no click sent).
-                // If no second tap, the buffered click fires after the delay.
-                const btn = fingerCount >= 2 ? 3 : 1;
-                _cancelBufferedClick();
-                _bufferedClickBtn = btn;
-                _bufferedClickTimer = setTimeout(() => {
-                    _bufferedClickTimer = null;
-                    sendTp({t: 'c', b: _bufferedClickBtn});
-                }, DOUBLE_TAP_WINDOW);
-            }
-            fingerCount = 0;
-            longPressFired = false;
-        }
-        function onTouchCancel(e) {
-            e.preventDefault();
-            e.currentTarget.classList.remove('touching');
-            if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
-            _cancelBufferedClick();
-            if (scrolling) { scrolling = false; if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = null; } if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = null; } scrollAccum = 0; scrollVelocity = 0; lastScrollTime = 0; sendTp({t: 'ss'}); }
-            if (dragging) { dragging = false; sendTp({t: 'd', a: 'up'}); }
-            moved = false; fingerCount = 0; totalDist = 0;
-        }
-        pad.addEventListener('touchend', onTouchEnd, {passive: false});
-        pad.addEventListener('touchcancel', onTouchCancel, {passive: false});
-
-        // Attach same touch handlers to screen canvas (trackpad works on screen mirror too)
-        const screenCanvas = document.getElementById('screenCanvas');
-        if (screenCanvas) {
-            screenCanvas.addEventListener('touchstart', onTouchStart, {passive: false});
-            screenCanvas.addEventListener('touchmove', onTouchMove, {passive: false});
-            screenCanvas.addEventListener('touchend', onTouchEnd, {passive: false});
-            screenCanvas.addEventListener('touchcancel', onTouchCancel, {passive: false});
-        }
-
-        // ===== HAPTIC FEEDBACK =====
-        // Audio click (both) + vibration (Android)
-        let clickCtx = null;
-
-        const playClick = () => {
-            try {
-                if (!clickCtx) clickCtx = new (window.AudioContext || window.webkitAudioContext)();
-                if (clickCtx.state === 'suspended') clickCtx.resume();
-                const osc = clickCtx.createOscillator();
-                const gain = clickCtx.createGain();
-                osc.connect(gain);
-                gain.connect(clickCtx.destination);
-                osc.frequency.value = 1800;
-                gain.gain.setValueAtTime(0.15, clickCtx.currentTime);
-                gain.gain.exponentialRampToValueAtTime(0.001, clickCtx.currentTime + 0.05);
-                osc.start(clickCtx.currentTime);
-                osc.stop(clickCtx.currentTime + 0.05);
-            } catch(e) {}
-        };
-
-        const haptic = () => {
-            try { navigator.vibrate && navigator.vibrate(30); } catch(e) {}
-            playClick();
-        };
-
-        // Micro haptic for repeat actions (softer vibration + quieter tick)
-        const microHaptic = () => {
-            try { navigator.vibrate && navigator.vibrate(10); } catch(e) {}
-            try {
-                if (!clickCtx) clickCtx = new (window.AudioContext || window.webkitAudioContext)();
-                if (clickCtx.state === 'suspended') clickCtx.resume();
-                const osc = clickCtx.createOscillator();
-                const gain = clickCtx.createGain();
-                osc.connect(gain);
-                gain.connect(clickCtx.destination);
-                osc.frequency.value = 1800;
-                gain.gain.setValueAtTime(0.15, clickCtx.currentTime);
-                gain.gain.exponentialRampToValueAtTime(0.001, clickCtx.currentTime + 0.02);
-                osc.start(clickCtx.currentTime);
-                osc.stop(clickCtx.currentTime + 0.02);
-            } catch(e) {}
-        };
-
-        // ===== KEY BUTTONS =====
-        const enterBtn = document.getElementById('enterBtn');
-        const bsBtn = document.getElementById('backspaceBtn');
-
-        // Enter button with glow + haptic
-        enterBtn.addEventListener('touchstart', e => { e.preventDefault(); haptic(); enterBtn.classList.add('active'); sendTp({t: 'k', k: 'enter'}); });
-        enterBtn.addEventListener('touchend', () => enterBtn.classList.remove('active'));
-        enterBtn.addEventListener('touchcancel', () => enterBtn.classList.remove('active'));
-        enterBtn.addEventListener('mousedown', () => { haptic(); enterBtn.classList.add('active'); sendTp({t: 'k', k: 'enter'}); });
-        enterBtn.addEventListener('mouseup', () => enterBtn.classList.remove('active'));
-        enterBtn.addEventListener('mouseleave', () => enterBtn.classList.remove('active'));
-
-        // Backspace with hold-to-repeat, glow + haptic
-        let bsInterval = null;
-        let bsTimeout = null;
-        const startBackspace = () => {
-            haptic();
-            bsBtn.classList.add('active');
-            sendTp({t: 'k', k: 'backspace'});
-            // Wait 300ms before starting repeat with micro haptic
-            bsTimeout = setTimeout(() => {
-                bsInterval = setInterval(() => { microHaptic(); sendTp({t: 'k', k: 'backspace'}); }, 40);
-            }, 300);
-        };
-        const stopBackspace = () => {
-            bsBtn.classList.remove('active');
-            if (bsTimeout) { clearTimeout(bsTimeout); bsTimeout = null; }
-            if (bsInterval) { clearInterval(bsInterval); bsInterval = null; }
-        };
-        bsBtn.addEventListener('touchstart', e => { e.preventDefault(); startBackspace(); });
-        bsBtn.addEventListener('touchend', stopBackspace);
-        bsBtn.addEventListener('touchcancel', stopBackspace);
-        bsBtn.addEventListener('mousedown', startBackspace);
-        bsBtn.addEventListener('mouseup', stopBackspace);
-        bsBtn.addEventListener('mouseleave', stopBackspace);
-
-        // ===== STREAMING AUDIO =====
-        let audioWs = null;
-        let audioContext = null;
-        let workletNode = null;
-        let sourceNode = null;
-        let mediaStream = null;
-        let sessionActive = false;
-        let isStreaming = false;
-        let micState = 'idle';
-        let micLongPressTimer = null;
-        let micTouchStartY = 0;
-        let micTouchId = null;
-        const MIC_LONG_PRESS_MS = 300;
-        const SLIDE_UP_PX = 60;
-        let paused = false;
-        let isMuted = false;
-        let micReady = false;
-
-        // WebSocket reconnection state
-        let reconnectAttempts = 0;
-        let maxReconnectAttempts = 5;
-        let reconnectDelays = [1000, 2000, 5000, 10000, 10000]; // Exponential backoff
-        let isReconnecting = false;
-
-        function setMicState(newState) {
-            micState = newState;
-            micBtn.classList.remove('waiting', 'holding', 'locked', 'processing');
-            micIconMic.style.display = 'none';
-            micIconLock.style.display = 'none';
-            switch (newState) {
-                case 'idle':
-                    micIconMic.style.display = 'flex';
-                    micHint.textContent = '';
-                    micBtn.disabled = false;
-                    break;
-                case 'waiting':
-                    micBtn.classList.add('waiting');
-                    micIconMic.style.display = 'flex';
-                    micHint.textContent = '';
-                    break;
-                case 'holding':
-                    micBtn.classList.add('holding');
-                    micIconMic.style.display = 'flex';
-                    micHint.textContent = 'Slide up to lock';
-                    break;
-                case 'locked':
-                    micBtn.classList.add('locked');
-                    micIconLock.style.display = 'flex';
-                    micHint.textContent = 'Tap to stop';
-                    break;
-                case 'processing':
-                    micBtn.classList.add('processing');
-                    micIconMic.style.display = 'flex';
-                    micHint.textContent = '';
-                    micBtn.disabled = true;
-                    break;
-            }
-        }
-
-        const processorCode = `
-            class PCMProcessor extends AudioWorkletProcessor {
-                constructor() {
-                    super();
-                    this.ratio = sampleRate / 16000;
-                    this.buffer = new Float32Array(512);
-                    this.idx = 0;
-                    this.resamplePos = 0;
-                }
-                flush() {
-                    const int16 = new Int16Array(512);
-                    for (let j = 0; j < 512; j++) {
-                        const s = Math.max(-1, Math.min(1, this.buffer[j]));
-                        int16[j] = s < 0 ? s * 32768 : s * 32767;
-                    }
-                    this.port.postMessage(int16.buffer, [int16.buffer]);
-                    this.buffer = new Float32Array(512);
-                    this.idx = 0;
-                }
-                process(inputs) {
-                    const input = inputs[0]?.[0];
-                    if (!input) return true;
-                    if (this.ratio <= 1.01) {
-                        for (let i = 0; i < input.length; i++) {
-                            this.buffer[this.idx++] = input[i];
-                            if (this.idx >= 512) this.flush();
-                        }
-                    } else {
-                        for (let i = 0; i < input.length; i++) {
-                            this.resamplePos += 16000;
-                            if (this.resamplePos >= sampleRate) {
-                                this.resamplePos -= sampleRate;
-                                this.buffer[this.idx++] = input[i];
-                                if (this.idx >= 512) this.flush();
-                            }
-                        }
-                    }
-                    return true;
-                }
-            }
-            registerProcessor('pcm-processor', PCMProcessor);
-        `;
-
-        async function initMic() {
-            try {
-                status.textContent = 'Requesting mic...';
-                mediaStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        sampleRate: 16000,
-                        channelCount: 1,
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true  // Normalize volume for quiet/loud speakers
-                    }
-                });
-                try { audioContext = new AudioContext({ sampleRate: 16000 }); }
-                catch (_) { audioContext = new AudioContext(); }
-                console.log('AudioContext sampleRate:', audioContext.sampleRate);
-                const blob = new Blob([processorCode], { type: 'application/javascript' });
-                await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
-                micReady = true;
-                console.log('Mic acquired');
-            } catch (err) {
-                console.error('Mic error:', err);
-                status.textContent = 'Mic denied: ' + err.message;
-                throw err;  // Propagate error to startStreaming
-            }
-        }
-
-        function connectAudioWs() {
-            return new Promise((resolve, reject) => {
-                audioWs = new WebSocket('wss://' + location.host + '/ws-audio-stream');
-                audioWs.binaryType = 'arraybuffer';
-
-                audioWs.onopen = () => {
-                    const tokenBytes = new TextEncoder().encode(_wsToken);
-                    const authMsg = new Uint8Array(1 + tokenBytes.length);
-                    authMsg[0] = 0xFA;
-                    authMsg.set(tokenBytes, 1);
-                    audioWs.send(authMsg.buffer);
-                    console.log('Audio WS connected');
-                    resolve();
-                };
-
-                audioWs.onmessage = (e) => {
-                    const data = new Uint8Array(e.data);
-                    const type = data[0];
-                    const payload = new TextDecoder().decode(data.slice(1));
-
-                    if (type === MSG_SESSION_READY) {
-                        sessionActive = true;
-                        status.textContent = 'Listening...';
-                        startAudioCapture();
-                    } else if (type === MSG_SESSION_DONE) {
-                        sessionActive = false;
-                        status.textContent = 'Done';
-                        cleanup();
-                    } else if (type === MSG_PARTIAL) {
-                        result.textContent = payload;
-                        result.classList.add('partial');
-                    } else if (type === MSG_FINAL) {
-                        result.textContent = payload;
-                        result.classList.remove('partial');
-                        if (sessionActive) status.textContent = 'Listening...';
-                    } else if (type === MSG_VAD_STATUS) {
-                        if (sessionActive) status.textContent = data[1] === 0x01 ? 'Streaming...' : 'Listening...';
-                    } else if (type === MSG_BACKPRESSURE) {
-                        paused = true;
-                        setTimeout(() => { paused = false; }, 500);
-                    } else if (type === MSG_INPUT_PAUSED) {
-                        if (gyroAutoSwitch && inputMode === 'gyro') switchMode('trackpad');
-                        status.textContent = 'Paused \u2014 laptop input active';
-                        status.classList.add('paused');
-                        status.classList.remove('recording');
-                    } else if (type === MSG_INPUT_RESUMED) {
-                            status.textContent = sessionActive ? 'Listening...' : 'Ready';
-                        status.classList.remove('paused');
-                        if (sessionActive) status.classList.add('recording');
-                    } else if (type === MSG_ERROR) {
-                        status.textContent = 'Error: ' + payload;
-                        console.error('Server error:', payload);
-                    }
-                };
-
-                audioWs.onclose = (e) => {
-                    console.log('Audio WS closed:', e.code);
-
-                    if (e.code === 4401) {
-                        console.warn('Audio WS: session expired (4401)');
-                        status.textContent = 'Session expired \u2014 refresh page';
-                        cleanup();
-                        return;
-                    }
-
-                    // Auto-reconnect on unexpected disconnection
-                    if (e.code !== 1000 && isStreaming && !isReconnecting && reconnectAttempts < maxReconnectAttempts) {
-                        isReconnecting = true;
-                        const delay = reconnectDelays[reconnectAttempts];
-                        reconnectAttempts++;
-                        status.textContent = `Reconnecting (${reconnectAttempts}/${maxReconnectAttempts})...`;
-                        console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${maxReconnectAttempts})`);
-
-                        setTimeout(async () => {
-                            try {
-                                await connectAudioWs();
-                                console.log('Reconnected successfully');
-                                reconnectAttempts = 0; // Reset on success
-                                isReconnecting = false;
-
-                                // Resume streaming if still in streaming mode
-                                if (isStreaming && audioWs?.readyState === WebSocket.OPEN) {
-                                    audioWs.send(new Uint8Array([MSG_START_SESSION]));
-                                }
-                            } catch (err) {
-                                console.error('Reconnection failed:', err);
-                                isReconnecting = false;
-
-                                if (reconnectAttempts >= maxReconnectAttempts) {
-                                    status.textContent = 'Connection lost - please refresh';
-                                    cleanup();
-                                }
-                            }
-                        }, delay);
-                    } else if (e.code !== 1000 && isStreaming) {
-                        status.textContent = 'Disconnected';
-                        cleanup();
-                    }
-                };
-
-                audioWs.onerror = (err) => {
-                    console.error('Audio WS error:', err);
-                    reject(err);
-                };
-            });
-        }
-
-        function startAudioCapture() {
-            if (audioContext.state === 'suspended') audioContext.resume();
-
-            workletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
-            workletNode.port.onmessage = (e) => {
-                if (!sessionActive || paused || isMuted) return;
-                if (audioWs?.readyState === WebSocket.OPEN) {
-                    const frame = new Uint8Array(1 + e.data.byteLength);
-                    frame[0] = MSG_AUDIO_FRAME;
-                    frame.set(new Uint8Array(e.data), 1);
-                    audioWs.send(frame);
-                }
-            };
-
-            sourceNode = audioContext.createMediaStreamSource(mediaStream);
-            sourceNode.connect(workletNode);
-        }
-
-        async function startStreaming() {
-            if (isStreaming) return;
-            isStreaming = true;
-            result.textContent = '';
-
-            try {
-                // Request mic access only when starting recording
-                if (!mediaStream) {
-                    status.textContent = 'Requesting mic...';
-                    await initMic();
-                }
-
-                await connectAudioWs();
-                audioWs.send(new Uint8Array([MSG_START_SESSION]));
-                status.textContent = 'Starting...';
-                status.classList.add('recording');
-
-            } catch (err) {
-                status.textContent = 'Connection failed';
-                isStreaming = false;
-                setMicState('idle');
-            }
-        }
-
-        function stopStreaming() {
-            if (!isStreaming) return;
-
-            if (audioWs?.readyState === WebSocket.OPEN && sessionActive) {
-                status.textContent = 'Processing...';
-                audioWs.send(new Uint8Array([MSG_END_SESSION]));
-                // DO NOT close here - wait for SESSION_DONE
-            } else {
-                cleanup();
-            }
-        }
-
-        function cleanup() {
-            isStreaming = false;
-            sessionActive = false;
-
-            if (workletNode) { workletNode.disconnect(); workletNode = null; }
-            if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
-            if (audioWs) { audioWs.close(); audioWs = null; }
-
-            // Release mic - stops the indicator on phone
-            if (mediaStream) {
-                mediaStream.getTracks().forEach(track => track.stop());
-                mediaStream = null;
-                micReady = false;
-                console.log('Mic released');
-            }
-
-            if (audioContext && audioContext.state !== 'closed') {
-                audioContext.close();
-                audioContext = null;
-            }
-
-            setMicState('idle');
-            status.textContent = 'Ready';
-            status.classList.remove('recording');
-        }
-
-        // ===== MIC BUTTON — Unified gesture handler =====
-        function cancelLongPress() {
-            if (micLongPressTimer) { clearTimeout(micLongPressTimer); micLongPressTimer = null; }
-        }
-
-        micBtn.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            if (micState === 'processing') return;
-            if (micState === 'locked') {
-                haptic();
-                stopStreaming();
-                setMicState('processing');
-                status.textContent = 'Processing...';
-                status.classList.remove('recording');
-                return;
-            }
-            if (micState === 'idle') {
-                const touch = e.changedTouches[0];
-                micTouchStartY = touch.clientY;
-                micTouchId = touch.identifier;
-                setMicState('waiting');
-                micLongPressTimer = setTimeout(async () => {
-                    micLongPressTimer = null;
-                    haptic();
-                    setMicState('holding');
-                    result.textContent = '';
-                    status.classList.add('recording');
-                    await startStreaming();
-                }, MIC_LONG_PRESS_MS);
-            }
-        }, { passive: false });
-
-        micBtn.addEventListener('touchmove', (e) => {
-            if (micState !== 'holding' && micState !== 'waiting') return;
-            const touch = Array.from(e.changedTouches).find(t => t.identifier === micTouchId);
-            if (!touch) return;
-            const deltaY = micTouchStartY - touch.clientY;
-            if (micState === 'waiting' && Math.abs(deltaY) > 20) {
-                cancelLongPress();
-                setMicState('idle');
-                return;
-            }
-            if (micState === 'holding' && deltaY > SLIDE_UP_PX) {
-                haptic();
-                setMicState('locked');
-                micTouchId = null;
-            }
-        }, { passive: false });
-
-        micBtn.addEventListener('touchend', (e) => {
-            const touch = Array.from(e.changedTouches).find(t => t.identifier === micTouchId);
-            if (micState === 'waiting') {
-                cancelLongPress();
-                setMicState('idle');
-                return;
-            }
-            if (micState === 'holding' && touch) {
-                stopStreaming();
-                setMicState('processing');
-                status.textContent = 'Processing...';
-                status.classList.remove('recording');
-                micTouchId = null;
-                return;
-            }
-        }, { passive: false });
-
-        micBtn.addEventListener('touchcancel', () => {
-            cancelLongPress();
-            if (micState === 'waiting') {
-                setMicState('idle');
-            } else if (micState === 'holding') {
-                stopStreaming();
-                setMicState('processing');
-                status.textContent = 'Processing...';
-                status.classList.remove('recording');
-            }
-            micTouchId = null;
-        });
-
-        // Mouse fallback for desktop testing
-        let mouseIsDown = false;
-        micBtn.addEventListener('mousedown', (e) => {
-            e.preventDefault();
-            if (micState === 'processing') return;
-            if (micState === 'locked') {
-                haptic();
-                stopStreaming();
-                setMicState('processing');
-                status.textContent = 'Processing...';
-                status.classList.remove('recording');
-                return;
-            }
-            if (micState === 'idle') {
-                mouseIsDown = true;
-                micTouchStartY = e.clientY;
-                setMicState('waiting');
-                micLongPressTimer = setTimeout(async () => {
-                    micLongPressTimer = null;
-                    if (!mouseIsDown) return;
-                    haptic();
-                    setMicState('holding');
-                    result.textContent = '';
-                    status.classList.add('recording');
-                    await startStreaming();
-                }, MIC_LONG_PRESS_MS);
-            }
-        });
-        document.addEventListener('mousemove', (e) => {
-            if (!mouseIsDown || micState !== 'holding') return;
-            const deltaY = micTouchStartY - e.clientY;
-            if (deltaY > SLIDE_UP_PX) {
-                haptic();
-                setMicState('locked');
-                mouseIsDown = false;
-            }
-        });
-        document.addEventListener('mouseup', () => {
-            if (!mouseIsDown) return;
-            mouseIsDown = false;
-            if (micState === 'waiting') {
-                cancelLongPress();
-                setMicState('idle');
-            } else if (micState === 'holding') {
-                stopStreaming();
-                setMicState('processing');
-                status.textContent = 'Processing...';
-                status.classList.remove('recording');
-            }
-        });
-
-        // MUTE button - actually turns mic on/off
-        muteBtn.onclick = (e) => {
-            e.preventDefault();
-            haptic();
-            isMuted = !isMuted;
-            muteBtn.classList.toggle('muted', isMuted);
-            // Bounce animation
-            muteBtn.classList.remove('mute-anim');
-            void muteBtn.offsetWidth; // reflow trigger for re-animation
-            muteBtn.classList.add('mute-anim');
-            if (sessionActive) status.textContent = isMuted ? 'Muted' : 'Listening...';
-
-            // Actually disable/enable mic track
-            if (mediaStream) {
-                mediaStream.getAudioTracks().forEach(track => {
-                    track.enabled = !isMuted;
-                });
-            }
-        };
-        muteBtn.addEventListener('animationend', () => muteBtn.classList.remove('mute-anim'));
-
-        // ===== MOBILE LIFECYCLE MANAGEMENT =====
-
-        // Handle background tab - suspend/resume AudioContext on iOS
-        document.addEventListener('visibilitychange', () => {
-            if (document.hidden) {
-                // Tab went to background
-                if (audioContext && audioContext.state === 'running') {
-                    audioContext.suspend().then(() => {
-                        console.log('AudioContext suspended (background)');
-                    });
-                }
-            } else {
-                // Tab came to foreground — reconnect trackpad WS if dead
-                connectTrackpad();
-                if (audioContext && audioContext.state === 'suspended') {
-                    audioContext.resume().then(() => {
-                        console.log('AudioContext resumed (foreground)');
-                    });
-                }
-            }
-        });
-
-        // Handle network status - show offline/online feedback
-        window.addEventListener('offline', () => {
-            console.log('Network offline');
-            status.textContent = 'Offline - check connection';
-            // Don't cleanup, allow reconnection when back online
-        });
-
-        window.addEventListener('online', () => {
-            console.log('Network online');
-            // Reconnect trackpad WS immediately
-            connectTrackpad();
-            if (isStreaming && (!audioWs || audioWs.readyState !== WebSocket.OPEN)) {
-                status.textContent = 'Reconnecting...';
-                // Trigger reconnection attempt
-                reconnectAttempts = 0;
-                isReconnecting = false;
-            } else {
-                status.textContent = 'Ready';
-            }
-        });
-
-        // iOS sample rate detection - log actual sample rate
-        // (iOS often ignores requested 16kHz and uses 48kHz instead)
-        // Our AudioWorklet already handles resampling to 512 samples
-        // so this is mainly for debugging/logging
-        if (navigator.mediaDevices && navigator.mediaDevices.getSupportedConstraints) {
-            const constraints = navigator.mediaDevices.getSupportedConstraints();
-            console.log('Supported audio constraints:', constraints);
-        }
-
-        // ===== SCREEN MIRROR =====
-        const screenBtn = document.getElementById('screenBtn');
-        const screenOverlay = document.getElementById('screenOverlay');
-        const screenBackBtn = document.getElementById('screenBackBtn');
-        const screenFpsEl = document.getElementById('screenFps');
-        const screenCtx = screenCanvas ? screenCanvas.getContext('2d') : null;
-        const screenResEl = document.getElementById('screenRes');
-        if (screenResEl) screenResEl.value = localStorage.getItem('screenRes') || '1080p';
-        let screenWs = null;
-        let videoDecoder = null;
-        let screenActive = false;
-        let screenFrameCount = 0;
-        let screenFpsTimer = null;
-
-        function startScreenMirror() {
-            if (screenActive) return;
-            if (typeof VideoDecoder === 'undefined') {
-                alert('WebCodecs not supported in this browser');
-                return;
-            }
-            screenActive = true;
-            screenOverlay.classList.add('active');
-
-            videoDecoder = new VideoDecoder({
-                output: (frame) => {
-                    screenCanvas.width = frame.displayWidth;
-                    screenCanvas.height = frame.displayHeight;
-                    screenCtx.drawImage(frame, 0, 0);
-                    frame.close();
-                    screenFrameCount++;
-                },
-                error: (e) => { console.error('VideoDecoder error:', e); }
-            });
-
-            const resSelect = document.getElementById('screenRes');
-            const resParam = resSelect ? resSelect.value : '';
-            let screenUrl = 'wss://' + location.host + '/ws-screen';
-            if (resParam) screenUrl += '?res=' + resParam;
-            if (resSelect) localStorage.setItem('screenRes', resSelect.value);
-            screenWs = new WebSocket(screenUrl);
-            screenWs.binaryType = 'arraybuffer';
-
-            screenWs.onopen = () => {
-                // Send MSG_AUTH (0xFA + token)
-                const tokenBytes = new TextEncoder().encode(_wsToken);
-                const authMsg = new Uint8Array(1 + tokenBytes.length);
-                authMsg[0] = 0xFA;
-                authMsg.set(tokenBytes, 1);
-                screenWs.send(authMsg.buffer);
-            };
-
-            let configured = false;
-
-            screenWs.onmessage = (e) => {
-                const data = new Uint8Array(e.data);
-                if (data[0] === 0x20) {
-                    // SCREEN_CONFIG: [0x20][width:2LE][height:2LE][fps:1]
-                    const dv = new DataView(e.data);
-                    const w = dv.getUint16(1, true);
-                    const h = dv.getUint16(3, true);
-                    console.log(`Screen: ${w}x${h}@${data[5]}fps`);
-                    return;
-                }
-
-                // Frame: [flags:1][timestamp:4LE][h264_data:N]
-                const flags = data[0];
-                const isKey = !!(flags & 0x01);
-                const timestamp = new DataView(e.data).getUint32(1, true);
-                const h264Data = new Uint8Array(e.data, 5);
-
-                if (!configured && isKey) {
-                    // Configure decoder on first keyframe
-                    // Extract codec string from SPS NAL
-                    let codecStr = 'avc1.42001e'; // baseline profile level 3.0 default
-                    // Find SPS in the data to build proper codec string
-                    for (let i = 0; i < h264Data.length - 5; i++) {
-                        if (h264Data[i] === 0 && h264Data[i+1] === 0 && h264Data[i+2] === 0 && h264Data[i+3] === 1) {
-                            const nalType = h264Data[i+4] & 0x1F;
-                            if (nalType === 7 && i + 7 < h264Data.length) {
-                                // SPS found: profile_idc, constraint_flags, level_idc
-                                const profile = h264Data[i+5].toString(16).padStart(2, '0');
-                                const compat = h264Data[i+6].toString(16).padStart(2, '0');
-                                const level = h264Data[i+7].toString(16).padStart(2, '0');
-                                codecStr = `avc1.${profile}${compat}${level}`;
-                                break;
-                            }
-                        }
-                    }
-                    try {
-                        videoDecoder.configure({
-                            codec: codecStr,
-                            optimizeForLatency: true,
-                        });
-                        configured = true;
-                        console.log('VideoDecoder configured:', codecStr);
-                    } catch (err) {
-                        console.error('Failed to configure decoder:', err);
-                        return;
-                    }
-                }
-
-                if (!configured) return; // Wait for first keyframe
-
-                try {
-                    videoDecoder.decode(new EncodedVideoChunk({
-                        type: isKey ? 'key' : 'delta',
-                        timestamp: timestamp * 1000, // microseconds
-                        data: h264Data,
-                    }));
-                } catch (err) {
-                    console.error('Decode error:', err);
-                }
-            };
-
-            screenWs.onclose = (e) => {
-                console.log('Screen WS closed:', e?.code);
-                if (e?.code === 4401) {
-                    console.warn('Screen WS: session expired (4401)');
-                    status.textContent = 'Session expired \u2014 refresh page';
-                }
-                stopScreenMirror();
-            };
-            screenWs.onerror = () => { console.error('Screen WS error'); };
-
-            // FPS counter
-            screenFrameCount = 0;
-            screenFpsTimer = setInterval(() => {
-                screenFpsEl.textContent = screenFrameCount + ' fps';
-                screenFrameCount = 0;
-            }, 1000);
-        }
-
-        function stopScreenMirror() {
-            screenActive = false;
-            screenOverlay.classList.remove('active');
-            if (screenWs && screenWs.readyState === WebSocket.OPEN) {
-                screenWs.close(1000);
-            }
-            screenWs = null;
-            if (videoDecoder && videoDecoder.state !== 'closed') {
-                try { videoDecoder.close(); } catch(e) {}
-            }
-            videoDecoder = null;
-            if (screenFpsTimer) {
-                clearInterval(screenFpsTimer);
-                screenFpsTimer = null;
-            }
-            screenFpsEl.textContent = '--';
-        }
-
-        screenBtn.addEventListener('click', () => { haptic(); startScreenMirror(); });
-        screenBackBtn.addEventListener('click', () => { haptic(); stopScreenMirror(); });
-
-        // Init - don't request mic until user starts recording
-        status.textContent = 'Ready';
-    </script>
-</body>
-</html>
-'''
-
-# Pre-encode HTML to bytes once at import time (skip 43KB UTF-8 encode per request)
-_html_bytes = HTML_CONTENT.encode("utf-8")
+def _load_html_bytes() -> bytes:
+    """Load the embedded web client HTML from static/index.html.
+
+    Cached at import time so per-request cost is the same as the previous
+    inline-string approach. Splitting the HTML out (was 1893 lines wedged
+    into a triple-quoted Python literal at this site) lets us actually
+    lint, format, and test it as JavaScript instead of as a Python string.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(script_dir)
+    html_path = os.path.join(root_dir, "static", "index.html")
+    try:
+        with open(html_path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        try:
+            log_warning(f"Failed to load static/index.html: {e}")
+        except Exception:
+            pass
+        return (
+            b"<!DOCTYPE html><html><body>"
+            b"<h1>Sanketra server</h1>"
+            b"<p>Static web client missing. Re-run <code>python setup.py</code> on this PC.</p>"
+            b"</body></html>"
+        )
+
+# Pre-load HTML to bytes once at import time (skip ~98 KB UTF-8 read per request)
+_html_bytes = _load_html_bytes()
 
 # =============================================================================
 #                              SSL CERT GENERATION
@@ -4400,22 +4897,30 @@ if __name__ == "__main__":
                     svc_text = svc_text.replace("TimeoutStopSec=3", "TimeoutStopSec=10")
                     with open(svc_path, "w") as f:
                         f.write(svc_text)
-                    os.system("systemctl --user daemon-reload")
+                    # A9-P3-5: Use subprocess.run instead of os.system (no shell injection risk here,
+                    # but consistent with the rest of the codebase)
+                    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
                     log_info("Self-healed systemd TimeoutStopSec 3→10")
         except Exception:
             pass
-    url = f"https://{ip}:{port}?token={AUTH_TOKEN}"
+    url = f"https://{ip}:{port}"
 
-    # Show URL
+    # Show URL (P0-1: never log/print AUTH_TOKEN — it's already in config.json)
     if not bg_mode:
         print(f"\n{'='*50}")
         print(f"Open: {url}")
+        print(f"Token: {AUTH_TOKEN}")
+        print(f"  ^ Do NOT share this token publicly")
+        if not _pair_locked:
+            print(f"Pair code: {_pair_code}")
         print(f"(Accept certificate warning on phone)")
         print(f"{'='*50}")
-        print_qr(url, save_image=False)
+        print_qr(f"{url}?token={AUTH_TOKEN}", save_image=False)
         print()
     else:
         log_info(f"URL: {url}")
+        if not _pair_locked:
+            log_info(f"Pair code: {_pair_code}")
 
     # Graceful shutdown: on Linux/macOS, let uvicorn handle SIGTERM natively
     # (it does proper lifespan teardown). Only override SIGBREAK on Windows

@@ -100,6 +100,9 @@ except ImportError:
 
 _app_input_paused = False
 _app_input_lock = _threading.Lock()
+# H6: callback list is mutated only via register/unregister (which take the lock).
+# Fan-out below grabs a snapshot under the lock then releases — callbacks run
+# unlocked so a slow callback can't block pause/resume.
 _pause_callbacks = []
 _last_pause_time = 0.0
 _PAUSE_COOLDOWN = 0.5  # seconds — don't allow resume until 500ms after last physical input
@@ -112,8 +115,9 @@ def pause_app_input():
         if _app_input_paused:
             return
         _app_input_paused = True
+        callbacks = tuple(_pause_callbacks)  # snapshot under lock
     log_info("[InputGuard] PAUSED - physical input detected")
-    for cb in _pause_callbacks:
+    for cb in callbacks:
         try:
             cb(True)
         except Exception:
@@ -135,20 +139,37 @@ def resume_app_input(force=False):
         if not force and _pause_time.time() - _last_pause_time < _PAUSE_COOLDOWN:
             return
         _app_input_paused = False
+        callbacks = tuple(_pause_callbacks)  # snapshot under lock
     log_info("[InputGuard] RESUMED - phone activity" + (" (forced)" if force else ""))
-    for cb in _pause_callbacks:
+    for cb in callbacks:
         try:
             cb(False)
         except Exception:
             pass
 
 def is_app_input_paused():
-    """Check if app input is currently paused (lock-free read)"""
-    return _app_input_paused
+    """Snapshot of pause state taken under the lock — safe for callers that
+    interleave with pause/resume callbacks. Without the lock, a worker thread
+    can read a stale value while the pause/resume path is mid-update (TOCTOU)."""
+    with _app_input_lock:
+        return _app_input_paused
 
 def register_pause_callback(cb):
-    """Register callback for pause/resume state changes. cb(paused: bool)"""
-    _pause_callbacks.append(cb)
+    """Register callback for pause/resume state changes. cb(paused: bool).
+    Idempotent — the same callback object is not added twice."""
+    with _app_input_lock:
+        if cb in _pause_callbacks:
+            return
+        _pause_callbacks.append(cb)
+
+def unregister_pause_callback(cb):
+    """Remove a previously-registered callback. Safe to call with an unknown
+    callback (no-op). Use from lifespan teardown / test cleanup to avoid leaks."""
+    with _app_input_lock:
+        try:
+            _pause_callbacks.remove(cb)
+        except ValueError:
+            pass
 
 # ============================================================================
 #                           PLATFORM DETECTION
@@ -300,7 +321,9 @@ STREAMING_SAMPLE_RATE = 16000
 STREAMING_CHUNK_SAMPLES = 512  # 32ms @ 16kHz - Silero VAD requirement
 STREAMING_MIN_SPEECH_MS = 250
 STREAMING_MIN_SILENCE_MS = 700  # AU-P1-4: 700ms for Hindi mid-sentence pauses (was 500ms, too aggressive)
-STREAMING_SILENCE_THRESHOLD = 22  # chunks for 700ms silence (700ms / 32ms per chunk ≈ 22)
+# Perceived-latency tradeoff: 22 chunks * 32ms = 704ms (not 500ms). Held at 22 because
+# 500ms cuts off Hindi mid-sentence pauses (sandhi, conjunct release) — see AU-P1-4.
+STREAMING_SILENCE_THRESHOLD = 22  # chunks ≈ 704ms (22 * 32ms); slow-speaker / Hindi-friendly
 
 # ============================================================================
 #                              GPU UTILITIES
@@ -1390,11 +1413,16 @@ _macos_accessibility_checked = False
 _macos_accessibility_ok = True
 _macos_accessibility_error = None  # Human-readable error string, or None if OK
 
-def _check_macos_accessibility():
+def _check_macos_accessibility(force_recheck=False):
     """One-time probe for macOS Accessibility permission via AXIsProcessTrusted().
-    Returns True if OK or not macOS. Caches result — safe to call from hot path."""
+    Returns True if OK or not macOS. Caches result — safe to call from hot path.
+
+    Args:
+        force_recheck: If True, ignore cache and re-probe. Used by /api/health to
+            reflect users granting/revoking Accessibility at runtime (no restart needed).
+    """
     global _macos_accessibility_checked, _macos_accessibility_ok, _macos_accessibility_error
-    if _macos_accessibility_checked:
+    if _macos_accessibility_checked and not force_recheck:
         return _macos_accessibility_ok
     if PLATFORM != 'macos':
         _macos_accessibility_checked = True
@@ -1436,21 +1464,37 @@ def _check_macos_accessibility():
             print(f"[stt_common] WARNING: {_macos_accessibility_error}")
     return _macos_accessibility_ok
 
-def check_input_health():
+def check_input_health(force_recheck=False):
     """Check if input dispatch is functional. Returns (ok: bool, error: str|None).
-    Safe to call at any time — runs macOS Accessibility probe once on first call."""
+    Safe to call at any time — runs macOS Accessibility probe once on first call.
+
+    Args:
+        force_recheck: If True, re-probe macOS Accessibility (bypasses cache).
+            Use from /api/health when the user may have toggled the setting.
+    """
     if PLATFORM == 'macos':
-        _check_macos_accessibility()
+        _check_macos_accessibility(force_recheck=force_recheck)
         if not _macos_accessibility_ok:
             return False, _macos_accessibility_error
     return True, None
 
-def is_typing_supported():
-    """Check if typing at cursor is supported on this platform"""
+def is_typing_supported(force_recheck=False):
+    """Check if typing at cursor is supported on this platform.
+
+    Args:
+        force_recheck: If True, bypass tool-detection cache (Linux) and re-probe.
+            Re-checks for xdotool/ydotool install (e.g. user installed at runtime).
+    """
     if PLATFORM == 'linux':
+        if force_recheck:
+            global _LINUX_INPUT_TOOL, _LINUX_INPUT_AVAILABLE
+            _LINUX_INPUT_TOOL = None
+            _LINUX_INPUT_AVAILABLE = None
         tool, available = get_linux_input_tool()
         return available
     else:
+        # macOS/Windows path — pyautogui import is the only gate.
+        # Accessibility probe (macOS) lives in check_input_health.
         try:
             import pyautogui
             return True
@@ -1690,9 +1734,23 @@ def _get_pynput_keyboard():
 # Direct Xlib for X11 (fastest - no pynput overhead, explicit flush)
 # Per-thread Display objects — Xlib Display is NOT thread-safe, so each thread
 # gets its own connection. Uses threading.local() to avoid races.
+#
+# M11 fix: each worker thread that calls _get_xlib_display() should call
+# close_xlib_display_for_thread() before exiting, otherwise the Display's socket
+# fd leaks until process exit. We also register a weakref.finalize so that
+# garbage collection of the thread-local Display closes the socket as a safety
+# net for short-lived threads that forget the explicit cleanup.
+import weakref as _weakref
 _xlib_thread_local = _threading.local()
 _xlib_available = False
 _xlib_init_attempted = False
+
+def _close_xlib_display_safely(display_obj):
+    """Helper for weakref.finalize — calls Display.close() and swallows errors."""
+    try:
+        display_obj.close()
+    except Exception:
+        pass
 
 def _get_xlib_display():
     """Get per-thread Xlib Display (thread-safe). Returns Display or None."""
@@ -1701,10 +1759,25 @@ def _get_xlib_display():
     if not hasattr(_xlib_thread_local, 'display') or _xlib_thread_local.display is None:
         try:
             import Xlib.display
-            _xlib_thread_local.display = Xlib.display.Display()
+            d = Xlib.display.Display()
+            _xlib_thread_local.display = d
+            # Safety net: close socket if the thread-local is GC'd before explicit cleanup
+            _weakref.finalize(_xlib_thread_local, _close_xlib_display_safely, d)
         except Exception:
             _xlib_thread_local.display = None
     return _xlib_thread_local.display
+
+def close_xlib_display_for_thread():
+    """Close this thread's Xlib Display socket (if any) and clear the slot.
+    Worker threads should call this on exit to release the X server fd
+    deterministically rather than waiting for GC."""
+    d = getattr(_xlib_thread_local, 'display', None)
+    if d is not None:
+        try:
+            d.close()
+        except Exception:
+            pass
+        _xlib_thread_local.display = None
 
 def _init_xlib():
     """Initialize direct Xlib connection for X11 (fastest mouse control)"""
@@ -2434,6 +2507,12 @@ def get_screen_resolution():
         _screen_cache = _detect_screen_size()
         _screen_cache_time = now
         return _screen_cache
+
+def prewarm_screen_detection():
+    """Pre-populate the screen-resolution cache so the first request handler
+    that needs it doesn't pay the xrandr/Quartz/SetProcessDpiAwareness cost.
+    Safe to call from lifespan startup. Returns the cached (w, h) tuple."""
+    return get_screen_resolution()
 
 def get_screen_resolution_physical():
     """Return physical pixel resolution (for screen capture).

@@ -94,7 +94,14 @@ def verify_session_token(
     - Empty token → False.
     - Token equals `master_token` (the TOFU pair-time AUTH_TOKEN) → True
       (constant-time comparison via secrets.compare_digest).
-    - Token in `sessions` and not expired → True.
+    - Token matches an unexpired entry in `sessions` → True.
+      We iterate `sessions` and compare via `secrets.compare_digest`
+      rather than `sessions.get(token)` because dict lookup leaks the
+      length of the longest shared prefix via PyHash timing. A targeted
+      attacker who can submit O(n) probes against a paired client could
+      reconstruct the token byte-by-byte. O(n) iteration costs us
+      effectively nothing — `n` is the number of paired clients (a
+      handful), and each comparison is a fixed-time 32-byte memcmp.
     - Otherwise False.
 
     Does NOT mutate `sessions`. Caller deletes expired entries if it wants;
@@ -104,7 +111,12 @@ def verify_session_token(
         return False
     if master_token and secrets.compare_digest(token, master_token):
         return True
-    session = sessions.get(token)
-    if session and not is_session_expired(session, now):
+    for stored_token, session in sessions.items():
+        if not isinstance(stored_token, str):
+            continue
+        if not secrets.compare_digest(stored_token, token):
+            continue
+        if is_session_expired(session, now):
+            return False
         return True
     return False

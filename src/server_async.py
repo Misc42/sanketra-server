@@ -84,6 +84,15 @@ _pair_locked = False  # True after first successful pair — blocks further pair
 # first-pair race on shared WiFi. 4-digit numeric code displayed in server console.
 _pair_code: str = f"{secrets.randbelow(10000):04d}"
 _blink_active = False
+# H10: serialize check-and-set for /api/blink so two concurrent POSTs cannot
+# both observe _blink_active==False, both flip it to True, and double-fire the
+# blink thread (which would leave _blink_active stuck True if one exits first).
+_blink_lock = threading.Lock()
+# F1: vocab_store mutation counter — bumped on every /api/vocab POST/PATCH/DELETE.
+# StreamingSession caches its hotwords string per generation; refresh only on
+# mismatch. Avoids list_entries() lock contention on the transcribe hot path
+# (~30 calls/s under load when each transcribe rebuilt the list).
+_vocab_generation: int = 0
 SERVER_PORT = 5000  # updated at startup from args
 _SERVICE_MODE = False  # Set True by --service flag
 _SERVER_START_TIME = time.time()  # For uptime in /api/health
@@ -198,6 +207,96 @@ def _set_app_password_hash(password_hash):
         config = _load_config()
         config["password_hash"] = password_hash
         _save_config(config)
+
+# R1: separate admin password hash for the /api/admin/update endpoint. Stored
+# under config["admin_password_hash"] — distinct from app_password_hash so a
+# leaked phone-pair token (master AUTH_TOKEN) cannot trigger arbitrary
+# git-reset-and-restart RCE.
+#
+# Setup flow (operator):
+#   1. SSH into the host that runs sanketra.
+#   2. python3 -c "from argon2 import PasswordHasher; \\
+#        print(PasswordHasher().hash('YOUR_ADMIN_PASSWORD'))"
+#   3. Edit ~/.config/sanketra/config.json and add:
+#        "admin_password_hash": "$argon2id$v=19$..."
+#   4. Restart server. /api/admin/update now requires header
+#        X-Admin-Token: YOUR_ADMIN_PASSWORD
+#      in addition to a valid session token. Without the hash configured,
+#      the endpoint refuses with 503.
+def _get_admin_password_hash():
+    """Get stored admin password hash from config (separate from app password)."""
+    with _config_lock:
+        config = _load_config()
+        return config.get("admin_password_hash", "")
+
+# L4: one-shot email-bound install tokens for /api/license-install.
+#
+# Coordinated with license/issuer.py: install_tokens table populated by webhook
+# on payment.captured. The server stores them under config["install_tokens"]
+# as a dict[str, dict] — token_str -> {email, license_track, created_at,
+# consumed_at}. Worktree A populates this dict; this module ONLY consumes.
+#
+# Forward-compat behavior:
+#   * If config["install_tokens"] is missing/empty: greenfield server with
+#     no payment integration yet — fall back to "auth token only" with a
+#     prominent log warning so an operator knows their server is in
+#     "trust-on-pair" mode.
+#   * If it's non-empty: every /api/license-install MUST include
+#     ?install_token=<value>. Token must exist, not be consumed, and the
+#     installed key's email must match the token's bound email.
+#   * On success, mark the token consumed (set consumed_at). One-shot.
+def _get_install_tokens() -> dict:
+    """Return a snapshot dict of install_tokens. Caller must NOT mutate."""
+    with _config_lock:
+        config = _load_config()
+        toks = config.get("install_tokens") or {}
+        if not isinstance(toks, dict):
+            return {}
+        return dict(toks)
+
+def _consume_install_token(token: str) -> "dict | None":
+    """Atomically mark an install token as consumed. Returns the token record
+    on success, or None if the token is unknown or already consumed."""
+    if not token:
+        return None
+    with _config_lock:
+        config = _load_config()
+        toks = config.get("install_tokens") or {}
+        if not isinstance(toks, dict):
+            return None
+        rec = toks.get(token)
+        if not isinstance(rec, dict):
+            return None
+        if rec.get("consumed_at"):
+            return None
+        rec["consumed_at"] = time.time()
+        toks[token] = rec
+        config["install_tokens"] = toks
+        _save_config(config)
+        return rec
+
+def _verify_admin_token(presented: str) -> bool:
+    """Constant-time verify of an admin token against the stored hash.
+
+    Returns False on any failure mode (no hash, mismatch, malformed) — the
+    caller logs and responds 401/503 as appropriate. Supports the same
+    Argon2id + PBKDF2-fallback formats as the app password hash so operators
+    on minimal images without argon2-cffi can still configure it."""
+    stored = _get_admin_password_hash()
+    if not stored or not presented:
+        return False
+    try:
+        if stored.startswith("pbkdf2:"):
+            _, salt, expected = stored.split(":", 2)
+            import hashlib as hl
+            computed = hl.pbkdf2_hmac("sha256", presented.encode(), salt.encode(), 100000).hex()
+            return secrets.compare_digest(computed, expected)
+        from argon2 import PasswordHasher
+        ph = PasswordHasher()
+        ph.verify(stored, presented)
+        return True
+    except Exception:
+        return False
 
 def _save_client_sessions():
     """Persist client sessions to config (synchronous write — blocks fsync).
@@ -418,6 +517,7 @@ MSG_FINAL         = 0x02  # + UTF-8 text
 MSG_VAD_STATUS    = 0x03  # + 1 byte (0x00=silence, 0x01=speech)
 MSG_PARTIAL       = 0x04  # + UTF-8 text (interim transcript, not typed)
 MSG_BACKPRESSURE  = 0xFE  # No payload (client must pause)
+MSG_BACKPRESSURE_CLEAR = 0xFD  # No payload (client may resume mic — buffer drained)
 MSG_SESSION_READY = 0xF0  # No payload
 MSG_SESSION_DONE  = 0xF1  # No payload (client may close)
 MSG_INPUT_PAUSED  = 0xF2  # No payload (physical input detected, app paused)
@@ -429,6 +529,7 @@ MSG_ERROR         = 0xFF  # + UTF-8 text
 _WIRE_VAD_SPEECH      = bytes([MSG_VAD_STATUS, 0x01])
 _WIRE_VAD_SILENCE     = bytes([MSG_VAD_STATUS, 0x00])
 _WIRE_BACKPRESSURE    = bytes([MSG_BACKPRESSURE])
+_WIRE_BACKPRESSURE_CLEAR = bytes([MSG_BACKPRESSURE_CLEAR])
 _WIRE_SESSION_READY   = bytes([MSG_SESSION_READY])
 _WIRE_SESSION_DONE    = bytes([MSG_SESSION_DONE])
 _WIRE_INPUT_PAUSED    = bytes([MSG_INPUT_PAUSED])
@@ -535,6 +636,197 @@ def _has_license_for_client(client_kind: str) -> bool:
         log_warning(f"[License] has_track({track}) errored — treating as free tier: {e}")
         return False
 
+
+# =============================================================================
+#                          FREE-TIER USAGE TRACKING
+# =============================================================================
+#
+# 200 minutes/calendar-month (UTC) STT cap for free-tier callers, persisted
+# locally at `~/.config/sanketra/usage.json`. No telemetry — the file never
+# leaves the machine. Shape on disk:
+#
+#     {
+#       "rollup_month": "2026-04",             # YYYY-MM (UTC)
+#       "minutes_used": {
+#         "android": 12.3,
+#         "desktop": 4.1,
+#         "web": 0.7
+#       }
+#     }
+#
+# Semantics:
+#   * One counter per client_kind — lets a user on a free install burn 200
+#     minutes of Android dictation AND 200 minutes of web dictation without
+#     them colliding. (A single counter would have been simpler but also
+#     felt punitive to the occasional browser user.)
+#   * Rolled up on the first WS auth of each UTC month (`_usage_ensure_rollup`).
+#   * Pro/Bundle callers do NOT decrement their track's counter — they're
+#     unlimited (guard in `_usage_check_and_maybe_close_ws`).
+#   * File write is atomic (tmp + fsync + os.replace). A crash mid-write
+#     leaves the last successfully written copy intact. Corrupt / unreadable
+#     file falls back to "0 minutes used this month" + a warning log —
+#     dictation must not brick on a JSON error.
+#
+# The module-level dict is guarded by `_usage_lock`. `_usage_track_seconds()`
+# is async (runs the file I/O in-executor to keep the loop responsive under
+# concurrent auth bursts).
+
+_USAGE_FILE = os.path.join(_CONFIG_DIR, "usage.json")
+_usage_lock: "asyncio.Lock | None" = None  # created in lifespan
+_usage_state: "dict | None" = None          # in-memory cache
+
+
+def _current_rollup_month(now: "float | None" = None) -> str:
+    """UTC YYYY-MM for the given (or current) epoch seconds. The rollup
+    key is compared verbatim — timezone math centralises here, not at
+    every call site."""
+    t = _now() if now is None else now
+    tm = time.gmtime(t)
+    return f"{tm.tm_year:04d}-{tm.tm_mon:02d}"
+
+
+def _empty_usage_state(now: "float | None" = None) -> dict:
+    return {
+        "rollup_month": _current_rollup_month(now),
+        "minutes_used": {kind: 0.0 for kind in VALID_CLIENT_KINDS},
+    }
+
+
+def _usage_load_from_disk() -> dict:
+    """Read `usage.json`. Return a fresh empty state on any failure —
+    corrupt file MUST NOT brick dictation. Callers always end up with a
+    usable dict."""
+    try:
+        with open(_USAGE_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if not isinstance(raw, dict):
+            raise ValueError("usage.json root is not an object")
+        month = raw.get("rollup_month")
+        minutes = raw.get("minutes_used", {})
+        if not isinstance(month, str) or not isinstance(minutes, dict):
+            raise ValueError("usage.json fields malformed")
+        # Coerce per-kind numbers; drop unknown kinds defensively.
+        clean_minutes = {}
+        for kind in VALID_CLIENT_KINDS:
+            v = minutes.get(kind, 0.0)
+            try:
+                clean_minutes[kind] = max(0.0, float(v))
+            except (TypeError, ValueError):
+                clean_minutes[kind] = 0.0
+        return {"rollup_month": month, "minutes_used": clean_minutes}
+    except FileNotFoundError:
+        return _empty_usage_state()
+    except Exception as e:
+        log_warning(f"[Usage] {_USAGE_FILE} unreadable ({e}); starting from 0 min")
+        return _empty_usage_state()
+
+
+def _usage_write_to_disk(state: dict) -> None:
+    """Atomic write: tmp + fsync + os.replace. Caller holds `_usage_lock`.
+    Swallow OSError — a failed write degrades to "counter doesn't persist
+    across restart" but does not break the running session. Logged at
+    WARN so we notice in field logs."""
+    try:
+        # Use the actual parent of _USAGE_FILE (not the hardcoded config
+        # dir) so tests that monkeypatch _USAGE_FILE into a tmpdir get
+        # their parent dir created correctly.
+        os.makedirs(os.path.dirname(_USAGE_FILE) or ".", exist_ok=True)
+        tmp = _USAGE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, _USAGE_FILE)
+    except OSError as e:
+        log_warning(f"[Usage] persist failed for {_USAGE_FILE}: {e}")
+
+
+def _usage_ensure_rollup(state: dict, now: "float | None" = None) -> bool:
+    """If `state.rollup_month` is stale (older UTC month), zero counters
+    and update the month. Returns True if a rollover happened (caller
+    should persist), False otherwise."""
+    current = _current_rollup_month(now)
+    if state.get("rollup_month") == current:
+        return False
+    state["rollup_month"] = current
+    state["minutes_used"] = {kind: 0.0 for kind in VALID_CLIENT_KINDS}
+    return True
+
+
+def _reset_usage_for_tests() -> None:
+    """Drop the in-memory usage cache + the async lock so the next access
+    recreates both on whatever loop is current. Test fixtures also flip
+    `SANKETRA_USAGE_PATH` (via monkeypatching `_USAGE_FILE`) for isolation."""
+    global _usage_state, _usage_lock
+    _usage_state = None
+    _usage_lock = None
+
+
+def _ensure_usage_lock() -> "asyncio.Lock":
+    """Lazily create `_usage_lock`. Tests skip the lifespan handler (they use
+    TestClient without the `with` form), so the lock must be creatable on
+    demand. Safe because Python's asyncio.Lock has no hidden init cost."""
+    global _usage_lock
+    if _usage_lock is None:
+        _usage_lock = asyncio.Lock()
+    return _usage_lock
+
+
+async def _usage_get_state() -> dict:
+    """Return the in-memory usage state, lazy-loading from disk on first
+    access and rolling up the month if needed. Holds `_usage_lock`."""
+    global _usage_state
+    lock = _ensure_usage_lock()
+    async with lock:
+        if _usage_state is None:
+            _usage_state = _usage_load_from_disk()
+        if _usage_ensure_rollup(_usage_state):
+            _usage_write_to_disk(_usage_state)
+        return _usage_state
+
+
+async def _usage_minutes_used(client_kind: str) -> float:
+    """Read the current accumulated minutes for `client_kind` (post rollup).
+    O(1); doesn't decrement anything."""
+    state = await _usage_get_state()
+    lock = _ensure_usage_lock()
+    async with lock:
+        return float(state["minutes_used"].get(client_kind, 0.0))
+
+
+async def _usage_track_seconds(client_kind: str, seconds: float) -> float:
+    """Add `seconds` of inference time to `client_kind`'s monthly counter.
+    Returns the new minute total. Pro/Bundle callers still get counted
+    (the number is useful for diagnostics) but only free tier is gated.
+
+    No-op on unknown client_kind (defense in depth — caller should have
+    validated; we don't want to silently grow a junk bucket)."""
+    if client_kind not in VALID_CLIENT_KINDS or seconds <= 0:
+        return 0.0
+    state = await _usage_get_state()
+    lock = _ensure_usage_lock()
+    async with lock:
+        if _usage_ensure_rollup(state):
+            _usage_write_to_disk(state)
+        state["minutes_used"][client_kind] = float(
+            state["minutes_used"].get(client_kind, 0.0)
+        ) + (seconds / 60.0)
+        total = state["minutes_used"][client_kind]
+        _usage_write_to_disk(state)
+        return total
+
+
+async def _usage_free_tier_exceeded(client_kind: str) -> bool:
+    """Should we refuse a new free-tier WS auth for this client_kind?
+    True when the caller has no license covering this track AND the
+    monthly cap is already reached.
+
+    Pro/Bundle callers always return False — unlimited."""
+    if _has_license_for_client(client_kind):
+        return False
+    used = await _usage_minutes_used(client_kind)
+    return used >= FREE_TIER_MONTHLY_MINUTES
+
 # =============================================================================
 #                              GLOBAL STATE
 # =============================================================================
@@ -602,6 +894,19 @@ class StreamingSession:
     # can skip DB writes entirely.
     history_session_id: Optional[int] = None
     client_name: Optional[str] = None  # 'Pixel 8' / 'Chrome on tman' — shown in dashboard
+    # F1: per-session cached hotwords + the _vocab_generation it was built from.
+    # Refreshed lazily by transcribe_sync when generation diverges. -1 forces
+    # first-call rebuild so the very first transcribe still picks up vocab.
+    cached_hotwords: Optional[str] = None
+    cached_hotwords_gen: int = -1
+    # X3: track whether server sent MSG_BACKPRESSURE so we only emit the
+    # matching MSG_BACKPRESSURE_CLEAR on false→true transition. Without this
+    # we'd fire a CLEAR on every chunk that landed under the threshold,
+    # regardless of whether we'd ever sent BACKPRESSURE in the first place.
+    backpressure_active: bool = False
+    # S14: consecutive processor errors. Reset on first successful frame.
+    # After PROCESSOR_MAX_CONSECUTIVE_ERRORS, the WS is closed with code 4500.
+    processor_consec_errors: int = 0
 
     def reset_vad(self):
         """Reset VAD state after transcription"""
@@ -649,13 +954,40 @@ def _task_done(t):
 #                              WHISPER INFERENCE (SYNC - runs in thread pool)
 # =============================================================================
 
-def transcribe_sync(audio: np.ndarray, hint_language: Optional[str] = None) -> tuple:
+def _build_hotwords_string() -> str:
+    """F1: snapshot vocab entries into a comma-separated hotwords string.
+
+    Called only on _vocab_generation bump from per-session cache. Lock cost
+    is paid once per vocab edit, not once per transcribe call. Empty string
+    is a safe `hotwords=` value for faster-whisper (== no boost)."""
+    try:
+        entries = vocab_store.get_default_store().list_entries()
+    except Exception as e:
+        log_warning(f"[Vocab] hotwords read failed: {e}")
+        return ""
+    parts = []
+    for e in entries:
+        t = e.get("text") if isinstance(e, dict) else None
+        if isinstance(t, str) and t.strip():
+            parts.append(t.strip())
+    return ", ".join(parts)
+
+
+def transcribe_sync(
+    audio: np.ndarray,
+    hint_language: Optional[str] = None,
+    session: Optional["StreamingSession"] = None,
+) -> tuple:
     """
     Synchronous Whisper transcription.
     Runs in thread pool, not in async loop.
 
     hint_language: previously detected language for this session (saves ~200ms re-detection).
     Caller should pass `session.cached_language` and store the returned `lang` back.
+
+    session: per-WS StreamingSession used for cached hotwords (F1). May be
+    None for callers that don't have a session (warmup, tests) — in that case
+    no hotwords are passed.
     """
     with _whisper_lock:
         model = whisper_model  # Snapshot under lock to avoid race with _load_model_async / _unload_model
@@ -664,14 +996,29 @@ def transcribe_sync(audio: np.ndarray, hint_language: Optional[str] = None) -> t
     if len(audio) < int(SAMPLE_RATE * 0.25):  # Min 250ms
         return "", ""
 
+    # F1: hotwords cached per-session, refreshed only when _vocab_generation
+    # bumps. Read the global once into a local — the read is atomic (PEP 3119),
+    # and rebuilding twice on a tie-race is harmless (next call observes the
+    # higher gen and stays cached).
+    hotwords_str = ""
+    if session is not None:
+        gen_now = _vocab_generation
+        if session.cached_hotwords_gen != gen_now or session.cached_hotwords is None:
+            session.cached_hotwords = _build_hotwords_string()
+            session.cached_hotwords_gen = gen_now
+        hotwords_str = session.cached_hotwords or ""
+
     try:
+        # F4: beam_size 1 → 5. Matches CLI (src/stt_vad.py) and yields ~3-7%
+        # WER win on Hindi/English mixed audio at ~30ms cost per utterance.
         segments, info = model.transcribe(
             audio,
             language=hint_language,
             vad_filter=False,
-            beam_size=1,
+            beam_size=5,
             condition_on_previous_text=False,
-            initial_prompt="Hindi aur English mein baat ho rahi hai."
+            initial_prompt="Hindi aur English mein baat ho rahi hai.",
+            hotwords=hotwords_str if hotwords_str else None,
         )
         text = " ".join([seg.text for seg in segments])
         return text.strip(), info.language
@@ -702,7 +1049,20 @@ def _check_any_token(token: str) -> bool:
 
 def _validate_ws_origin(ws: WebSocket) -> bool:
     """Validate WebSocket Origin header to prevent Cross-Site WebSocket Hijacking (CSWSH).
-    Allows: no Origin (native apps), localhost, and the server's own IP."""
+
+    Allows:
+      - No Origin header (native apps — Android OkHttp / desktop binary).
+      - localhost / 127.0.0.1 / ::1 (the embedded web client at /).
+      - The server's own LAN IP (the QR-coded URL the user scanned on phone).
+
+    H1: previously also allowed any RFC 1918 IP. That was a defense-in-depth
+    convenience for early multi-NIC dev, but it lets a same-LAN attacker
+    drive an outbound CSWSH attack from any browser tab to any phone-style
+    Origin (192.168.x.x). Tightened to "exactly the server IP".
+
+    S5: fail-CLOSED on parse exceptions. The original `return True` here was
+    defense-in-the-wrong-direction — a malformed Origin should be rejected,
+    not waved through."""
     origin = ws.headers.get("origin", "")
     if not origin:
         return True  # Native apps (Android OkHttp) don't send Origin
@@ -712,19 +1072,18 @@ def _validate_ws_origin(ws: WebSocket) -> bool:
         host = parsed.hostname or ""
         if host in ("localhost", "127.0.0.1", "::1"):
             return True
-        # Allow server's own IP
+        # Allow server's own IP (LAN clients hitting the QR-code URL).
         server_ip = get_local_ip()
-        if host == server_ip:
+        if server_ip and host == server_ip:
             return True
-        # Allow any RFC 1918 IP (LAN clients)
-        import ipaddress
-        try:
-            addr = ipaddress.ip_address(host)
-            return addr.is_private
-        except ValueError:
-            return False
-    except Exception:
-        return True  # Don't block on parse errors
+        # H1: previously had a broad RFC 1918 fallback here. Removed so a
+        # cross-LAN-tab attacker from a different private IP can't hijack.
+        return False
+    except Exception as e:
+        # S5: was return True (FAIL-OPEN). A parse error means we don't know
+        # what the origin is — treating that as trusted is a CSWSH bypass.
+        log_debug(f"[WS] origin parse failed for {origin!r}: {e}")
+        return False
 
 async def _authenticate_ws(ws: WebSocket) -> "str | None":
     """Authenticate WS: check query params first, then wait for MSG_AUTH first message.
@@ -811,7 +1170,9 @@ async def run_inference(session: StreamingSession, ws: WebSocket):
 
         loop = asyncio.get_event_loop()
         log_debug(f"[Stream] Transcribing {audio_duration:.2f}s of audio")
-        text, lang = await loop.run_in_executor(executor, transcribe_sync, audio, session.cached_language)
+        text, lang = await loop.run_in_executor(
+            executor, transcribe_sync, audio, session.cached_language, session
+        )
         # Cache detected language per-session — previously a module global, which
         # leaked language state between phone A (English) and phone B (Hindi)
         # sharing the same server instance.
@@ -902,7 +1263,9 @@ async def run_partial_inference(session: StreamingSession, ws: WebSocket):
             audio = preprocess_audio_buffer(audio, SAMPLE_RATE, config)
 
         loop = asyncio.get_event_loop()
-        text, lang = await loop.run_in_executor(executor, transcribe_sync, audio, session.cached_language)
+        text, lang = await loop.run_in_executor(
+            executor, transcribe_sync, audio, session.cached_language, session
+        )
         if lang in ("hi", "en", "ur"):
             session.cached_language = lang
 
@@ -995,6 +1358,14 @@ async def _process_audio_chunk(session: StreamingSession, ws: WebSocket, chunk: 
     # Backpressure: if inference running and buffer growing
     if session.pending_inference and len(session.audio_buffer) > MAX_BUFFER_FRAMES // 2:
         await _send_raw(ws, _WIRE_BACKPRESSURE)
+        session.backpressure_active = True
+    # X3: clear backpressure once buffer drains to <=25% of cap. We only emit
+    # CLEAR if we previously sent BACKPRESSURE for this session (false→true on
+    # the cleared side). Without the flag we'd spam CLEAR on every chunk under
+    # the threshold, even on sessions that never went over.
+    elif session.backpressure_active and len(session.audio_buffer) <= MAX_BUFFER_FRAMES // 4:
+        await _send_raw(ws, _WIRE_BACKPRESSURE_CLEAR)
+        session.backpressure_active = False
 
 # =============================================================================
 #                              WEBSOCKET HANDLER
@@ -1146,13 +1517,97 @@ async def ws_audio_stream(ws: WebSocket):
     token = await _accept_authenticated_ws(ws, cid, "Stream")
     if not token:
         return
+
+    # Resolve the caller's declared kind (android / desktop / web). Defaults
+    # to `web` when the header is absent — the local browser UI doesn't set
+    # it. Invalid header value is treated as "unknown" and rejected below.
+    client_kind = _client_kind_from_headers(ws.headers)
+    if client_kind is None:
+        _ws_log(cid, "warning", "[Stream] invalid X-Client-Kind header — rejecting")
+        try:
+            await ws.close(code=4400, reason="invalid X-Client-Kind")
+        except Exception:
+            pass
+        _unregister_ws(ws)
+        return
+
+    # Free-tier monthly quota. Pro/Bundle licenses for this track bypass.
+    # Check AT auth — fail-fast rather than letting the client open a session
+    # and hit the limit mid-dictation. Mid-session close is also supported
+    # below for callers that cross the line while streaming.
+    try:
+        if await _usage_free_tier_exceeded(client_kind):
+            minutes_used = await _usage_minutes_used(client_kind)
+            _ws_log(
+                cid, "info",
+                f"[Stream] free-tier cap reached for {client_kind} "
+                f"({minutes_used:.1f} / {FREE_TIER_MONTHLY_MINUTES} min); "
+                f"closing with 4402",
+            )
+            try:
+                await ws.close(code=4402, reason="free_tier_monthly_cap_reached")
+            except Exception:
+                pass
+            _unregister_ws(ws)
+            return
+    except Exception as e:
+        # Usage tracking must never brick dictation. Fail-open on internal
+        # error (log + proceed) — the next session auth will retry the check.
+        log_warning(f"[Usage] quota check failed (allowing session): {e}")
+
     # O-P1-2: derive a stable per-session suffix so the reconnect buffer is
     # keyed by (ip, token_hash). sha256(token)[:16] = 64 bits of entropy —
     # collision-safe at any realistic session count, and the raw token never
     # lands in a dict key that might surface in logs/diagnostics.
     import hashlib as _hl
     buffer_key: tuple[str, str] = (client_ip, _hl.sha256(token.encode()).hexdigest()[:16])
-    _ws_log(cid, "info", f"[Stream] Audio WS connected from {client_ip}")
+    _ws_log(cid, "info", f"[Stream] Audio WS connected from {client_ip} ({client_kind})")
+
+    # Per-session accumulator of raw audio seconds. Flushed to the persistent
+    # counter in batches (every _USAGE_FLUSH_SECONDS of audio, on END_SESSION,
+    # and on disconnect) so we don't fsync usage.json per 32ms frame.
+    session_seconds_pending = 0.0
+    session_seconds_flushed = 0.0
+    _USAGE_FLUSH_SECONDS = 5.0  # flush accumulator every 5 s of audio
+
+    async def _flush_usage(final: bool = False) -> None:
+        """Persist pending seconds into usage.json. Called on periodic
+        thresholds and at shutdown. `final` is advisory (reserved for
+        future "force write on disconnect regardless of batch size")."""
+        nonlocal session_seconds_pending, session_seconds_flushed
+        pending = session_seconds_pending
+        if pending <= 0 and not final:
+            return
+        try:
+            await _usage_track_seconds(client_kind, pending)
+        except Exception as e:
+            _ws_log(cid, "debug", f"[Usage] flush failed: {e}")
+            return
+        session_seconds_flushed += pending
+        session_seconds_pending = 0.0
+
+    async def _maybe_close_for_cap() -> bool:
+        """After flushing, re-check the cap. If we've crossed the line for
+        a free-tier caller, close the WS 4402 and return True so the outer
+        loop can break. Pro callers never enter this branch."""
+        if _has_license_for_client(client_kind):
+            return False
+        try:
+            used = await _usage_minutes_used(client_kind)
+        except Exception:
+            return False
+        if used < FREE_TIER_MONTHLY_MINUTES:
+            return False
+        _ws_log(
+            cid, "info",
+            f"[Stream] free-tier cap crossed mid-session "
+            f"({used:.1f} / {FREE_TIER_MONTHLY_MINUTES} min); closing 4402",
+        )
+        try:
+            await ws.close(code=4402, reason="free_tier_monthly_cap_reached")
+        except Exception:
+            pass
+        return True
 
     # Initialize session. vad_utils is a 5-tuple — either Silero's native tuple or
     # the EnergyVAD fallback's synthesized 5-tuple (see stt_common.load_vad). As
@@ -1181,15 +1636,53 @@ async def ws_audio_stream(ws: WebSocket):
 
     async def _processor_loop():
         """Drains frame_queue and feeds handle_audio_frame. Isolated from
-        ws.receive_bytes() so inference never starves the receiver."""
+        ws.receive_bytes() so inference never starves the receiver.
+
+        S14: count CONSECUTIVE failures. The pre-fix path log_debug'd every
+        error and kept going forever — a busted Whisper / OOM model meant
+        the WS stayed connected, swallowing audio with no transcripts and
+        no diagnostic. Now: first error logs WARNING, fifth consecutive
+        error logs ERROR with stack trace and closes the WS with code 4500.
+        Any successful frame resets the counter back to 0.
+        """
+        max_consec = 5
         while True:
             item = await frame_queue.get()
             if item is None:
                 return  # sentinel — shut down
             try:
                 await handle_audio_frame(session, ws, item)
+                # Success path — reset the consecutive counter so a transient
+                # blip doesn't ratchet us toward shutdown.
+                if session.processor_consec_errors:
+                    session.processor_consec_errors = 0
             except Exception as e:
-                _ws_log(cid, "debug", f"[Stream] processor frame error: {e}")
+                session.processor_consec_errors += 1
+                if session.processor_consec_errors == 1:
+                    _ws_log(cid, "warning", f"[Stream] processor frame error: {e}")
+                elif session.processor_consec_errors >= max_consec:
+                    # Fifth in a row — stack trace + close. Use logging directly
+                    # so we can attach exc_info=True (the log_error helper takes
+                    # only a single message arg).
+                    logging.error(
+                        f"[Stream cid={cid}] processor failed {max_consec}x in a row, closing WS",
+                        exc_info=True,
+                    )
+                    try:
+                        await send_message(ws, MSG_ERROR, b"processor errors")
+                    except Exception:
+                        pass
+                    try:
+                        await ws.close(code=4500, reason="processor failed repeatedly")
+                    except Exception:
+                        pass
+                    return
+                else:
+                    _ws_log(
+                        cid,
+                        "warning",
+                        f"[Stream] processor frame error ({session.processor_consec_errors}/{max_consec}): {e}",
+                    )
 
     processor_task = asyncio.create_task(_processor_loop())
     processor_task.add_done_callback(_task_done)
@@ -1305,6 +1798,11 @@ async def ws_audio_stream(ws: WebSocket):
             elif msg_type == MSG_END_SESSION:
                 _ws_log(cid, "info", "[Stream] End session requested")
                 await _drain_and_flush(final=True)
+                # Flush any tail seconds the 5 s batcher missed before we
+                # tell the client "session done". Usage is a hard contract —
+                # we persist on clean end even if we're below the batch
+                # threshold.
+                await _flush_usage(final=True)
                 await _send_raw(ws, _WIRE_SESSION_DONE)
                 session.session_active = False
                 # v1.2 history: close the sessions row. Idempotent.
@@ -1325,6 +1823,16 @@ async def ws_audio_stream(ws: WebSocket):
                         _audio_reconnect_buffers[buffer_key] = deque(maxlen=_RECONNECT_BUFFER_MAX_FRAMES)
                     _audio_reconnect_buffers[buffer_key].append(payload)
                     _enqueue_frame(payload)
+
+                    # Accumulate raw PCM seconds. PCM16LE @ 16 kHz mono =
+                    # 32000 bytes/sec. We count the payload we actually
+                    # received; a client flooding shorter-than-expected frames
+                    # still burns its minute budget proportionally.
+                    session_seconds_pending += len(payload) / (SAMPLE_RATE * 2.0)
+                    if session_seconds_pending >= _USAGE_FLUSH_SECONDS:
+                        await _flush_usage()
+                        if await _maybe_close_for_cap():
+                            break
 
             else:
                 await send_message(ws, MSG_ERROR, b"Unknown message type")
@@ -1356,7 +1864,20 @@ async def ws_audio_stream(ws: WebSocket):
                 history_db.get_default_db().end_session(session.history_session_id)
             except Exception as e:
                 log_warning(f"[History] end_session (disconnect) failed: {e}")
-        _ws_log(cid, "info", f"[Stream] WebSocket handler ended (processed {session.frames_processed} frames)")
+        # Persist any unflushed audio-seconds on abnormal disconnect so the
+        # user can't dodge the monthly cap by killing the socket mid-session.
+        # Safe to call even if _flush_usage already ran at END_SESSION — the
+        # accumulator is zero post-flush, so this becomes a no-op.
+        try:
+            await _flush_usage(final=True)
+        except Exception as e:
+            _ws_log(cid, "debug", f"[Usage] final flush failed: {e}")
+        _ws_log(
+            cid, "info",
+            f"[Stream] WebSocket handler ended "
+            f"(processed {session.frames_processed} frames, "
+            f"{session_seconds_flushed:.1f}s counted)",
+        )
 
 # =============================================================================
 #                              TRACKPAD WEBSOCKET
@@ -1772,7 +2293,11 @@ def init_models(preference="balanced", direct_model=None, verbose=True):
     setup_logging()
 
     # Thread pools always needed (even in IDLE for IO tasks like blink)
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
+    # S8: max_workers=2 assumes >= 6GB VRAM for Whisper-large; lower for tiny/base.
+    # CTranslate2's `model.transcribe` is internally serialized for a single model
+    # instance, so two workers only buy concurrency when the second call would
+    # otherwise block on a long first call (the typical paid-mode case).
+    executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="whisper")
     io_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="io")
     _model_load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-load")
 
@@ -1840,6 +2365,20 @@ def init_models(preference="balanced", direct_model=None, verbose=True):
     if vram_after > vram_before:
         log_info(f"VRAM used: {vram_after - vram_before:.2f} GB")
 
+    # F3: warmup transcribe — kicks CTranslate2 graph compile + GPU JIT so the
+    # first real user request doesn't pay the 1-2s cold-start tax. Best-effort:
+    # any failure is logged and ignored so a flaky warmup never blocks startup.
+    try:
+        whisper_model.transcribe(
+            np.zeros(16000, dtype=np.float32),
+            language="hi",
+            beam_size=1,
+            vad_filter=False,
+        )
+        log_info("Whisper warmup complete")
+    except Exception as e:
+        log_warning(f"Whisper warmup failed (non-fatal): {e}")
+
     log_info("Models loaded - ready to accept connections")
 
 
@@ -1893,15 +2432,13 @@ def _load_model_async(model_name, precision=None, force_device=None):
             _server_state = ServerState.IDLE
             return {"status": "cancelled"}
 
-        # Unload previous model if any
+        # S3: Hand-off swap. Keep the OLD model live for in-flight transcribes
+        # while the NEW one downloads/loads, then atomically replace under the
+        # lock. Memory cost is 2x model size for the duration of the load
+        # (acceptable trade for paid mode — we'd rather burn VRAM briefly than
+        # 401-bomb a request mid-transcribe with `model is None`).
         with _whisper_lock:
-            if whisper_model is not None:
-                whisper_model = None
-                if has_gpu:
-                    import gc
-                    gc.collect()
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
+            old_model = whisper_model
 
         _model_load_progress = 0.3
 
@@ -1925,17 +2462,10 @@ def _load_model_async(model_name, precision=None, force_device=None):
         # Check cancel again after the expensive load_whisper() call
         if _model_load_cancel:
             new_model = None
-            with _whisper_lock:
-                whisper_model = None
-            _loaded_model_name = None
-            if has_gpu:
-                import gc
-                gc.collect()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-            _server_state = ServerState.IDLE
+            # Don't touch whisper_model — the old one is still live and serving.
+            _server_state = ServerState.ACTIVE if old_model is not None else ServerState.IDLE
             _model_load_progress = 0.0
-            log_info("Model load cancelled after download")
+            log_info("Model load cancelled after download — keeping previous model active")
             return {"status": "cancelled"}
 
         with _whisper_lock:
@@ -1944,6 +2474,18 @@ def _load_model_async(model_name, precision=None, force_device=None):
         _loaded_device = device
         _model_load_progress = 1.0
         _server_state = ServerState.ACTIVE
+        # S3: drop the old model AFTER the swap so any in-flight transcribe
+        # that snapshotted it before the lock-hand-off can finish cleanly.
+        if old_model is not None:
+            try:
+                del old_model
+                if has_gpu:
+                    import gc
+                    gc.collect()
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                log_warning(f"[ModelLoad] old-model cleanup failed (non-fatal): {e}")
         log_info(f"Model loaded: {model_name} ({precision} on {device})")
         return {"status": "ready", "model": model_name, "precision": precision, "device": device}
 
@@ -2017,21 +2559,31 @@ def _on_pause_change(paused):
             asyncio.ensure_future, _broadcast_pause_state(paused)
         )
 
-async def _auto_unload_timer():
-    """Service mode: unload model after 15min no WS connections."""
+async def _rate_limit_gc_loop():
+    """H9: prune _pair_attempts / _auth_attempts in BOTH service AND legacy
+    mode. Previously this cleanup was inlined inside _auto_unload_timer,
+    which only spawns in service mode — meaning legacy-mode servers leaked
+    one dict entry per failed pair/auth attempt forever. Splitting the GC
+    out fixes that without coupling it to the model auto-unload feature."""
     while True:
-        await asyncio.sleep(30)  # Check every 30s for tighter unload precision
-
-        # P2-3: Periodic cleanup of rate limit dicts to prevent unbounded growth.
-        # Remove IPs whose attempt lists are empty or fully expired.
+        await asyncio.sleep(30)
         now = time.time()
-        for rate_dict, window in [(_pair_attempts, _PAIR_RATE_WINDOW), (_auth_attempts, _AUTH_LOCKOUT)]:
+        for rate_dict, window in [
+            (_pair_attempts, _PAIR_RATE_WINDOW),
+            (_auth_attempts, _AUTH_LOCKOUT),
+        ]:
             stale_ips = [
                 ip for ip, attempts in rate_dict.items()
                 if not attempts or all(now - t >= window for t in attempts)
             ]
             for ip in stale_ips:
                 del rate_dict[ip]
+
+
+async def _auto_unload_timer():
+    """Service mode: unload model after 15min no WS connections."""
+    while True:
+        await asyncio.sleep(30)  # Check every 30s for tighter unload precision
 
         if not _SERVICE_MODE or _server_state != ServerState.ACTIVE:
             continue
@@ -2090,6 +2642,7 @@ async def lifespan(app: FastAPI):
     # current at import, which may not be the request-serving loop.
     _model_load_lock = asyncio.Lock()
     _pair_mutex = asyncio.Lock()
+    # _usage_lock lazily created by _ensure_usage_lock(); tests skip lifespan.
 
     # N-P0-1: Schedule TCP_NODELAY after uvicorn binds sockets (deferred to next tick)
     _event_loop.call_soon(_set_tcp_nodelay_on_server)
@@ -2120,6 +2673,12 @@ async def lifespan(app: FastAPI):
             log_info("Physical input monitoring active")
         else:
             log_info("Physical input monitoring unavailable (permissions or pynput missing)")
+
+    # H9: rate-limit dict GC runs in BOTH modes to prevent unbounded growth
+    # in legacy mode (which never spun the auto-unload timer that used to
+    # host this cleanup).
+    gc_task = asyncio.create_task(_rate_limit_gc_loop())
+    gc_task.add_done_callback(_task_done)
 
     # Start auto-unload timer for service mode
     unload_task = None
@@ -2215,6 +2774,8 @@ async def lifespan(app: FastAPI):
 
     if udp_transport:
         udp_transport.close()
+    if gc_task:
+        gc_task.cancel()
     if unload_task:
         unload_task.cancel()
     if watchdog_task:
@@ -2241,12 +2802,27 @@ async def lifespan(app: FastAPI):
                 log_warning(f"[Shutdown] ffmpeg cleanup error: {e}")
         _active_ffmpeg_procs.clear()
 
-    # Wait for any in-flight Whisper inference to finish before releasing model.
-    # wait=True with a short timeout so we don't hang on stuck threads.
+    # C6: bounded shutdown for Whisper executor. The original wait=True path
+    # blocked forever if a transcribe call was stuck in CTranslate2 or a CUDA
+    # hang — common-enough on driver mismatch that ops complained. We now
+    # cancel queued futures and run the join in a worker with a hard
+    # timeout. If it doesn't drain in 10 s we proceed with shutdown anyway —
+    # CUDA cleanup will surface the underlying problem in the logs.
     global executor
     if executor:
-        executor.shutdown(wait=True, cancel_futures=True)
-        executor = None
+        old_executor = executor
+        executor = None  # Stop new submissions; in-flight refs still hold it.
+        old_executor.shutdown(wait=False, cancel_futures=True)
+        # Best-effort drain in a side thread so the asyncio loop doesn't block.
+        drain = threading.Thread(
+            target=lambda ex: [t.join(timeout=10.0) for t in list(ex._threads)],
+            args=(old_executor,),
+            daemon=True,
+        )
+        drain.start()
+        drain.join(timeout=10.0)
+        if drain.is_alive():
+            log_warning("[Shutdown] Whisper executor drain timed out — proceeding anyway")
 
     # GPU cleanup: release CTranslate2 model + PyTorch tensors + CUDA cache + pynvml
     global whisper_model, vad_model, vad_utils
@@ -2298,6 +2874,34 @@ _LAN_NETS = [
 ]
 _MAX_CONCURRENT_WS = 8  # 4 WS types (audio-in/trackpad/screen/audio-out) + headroom for reconnect overlap
 
+# H3: body-size cap. Rejects requests with Content-Length > 16 MiB up-front
+# so a misbehaving client can't OOM the server by streaming a 4 GB body into
+# request.body() / request.json(). Largest legitimate body in the API is the
+# accent calibration audio (~few MB of 16-bit PCM), so 16 MiB is comfortable
+# headroom. Streaming uploads (no Content-Length) bypass this; FastAPI's
+# request.body() is still bounded by ASGI server defaults.
+_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024  # 16 MiB
+
+@app.middleware("http")
+async def body_size_limit_middleware(request: Request, call_next):
+    """Reject oversized request bodies up-front so request.body() can't OOM."""
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            n = int(cl)
+        except ValueError:
+            return JSONResponse({"error": "invalid content-length"}, status_code=400)
+        if n > _MAX_REQUEST_BODY_BYTES:
+            log_warning(
+                f"[H3] body too large from {request.client.host}: {n} bytes > "
+                f"{_MAX_REQUEST_BODY_BYTES}"
+            )
+            return JSONResponse(
+                {"error": f"request body exceeds {_MAX_REQUEST_BODY_BYTES} bytes"},
+                status_code=413,
+            )
+    return await call_next(request)
+
 @app.middleware("http")
 async def lan_only_middleware(request: Request, call_next):
     """Reject non-LAN IPs in service mode (RFC 1918 check)."""
@@ -2317,6 +2921,14 @@ async def lan_only_middleware(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     # A19-P2-5: CSP — allows inline styles/scripts (embedded web client), wss: for WebSocket,
     # blob: for AudioWorklet, media: for video. Defense-in-depth against XSS injection.
+    #
+    # S7: 'unsafe-inline' for script-src is REQUIRED by static/index.html — it
+    # contains both inline <script> blocks and onclick= attribute handlers
+    # (verified by grep at the time of writing). Dropping it would break the
+    # embedded web client. The dashboard at /dashboard already uses external
+    # dashboard.js exclusively, so its rendering does not depend on the
+    # script-src exception. style-src 'unsafe-inline' is similarly required
+    # for the inline <style> block in index.html.
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline'; "
@@ -3548,13 +4160,35 @@ async def api_pair(request: Request):
 
 @app.post("/api/unpair")
 async def api_unpair(request: Request, token: str = Query(None)):
-    """Unlock pairing so a new device can pair. Requires valid auth token."""
+    """Unlock pairing so a new device can pair. Requires valid auth token.
+
+    S12: rotate AUTH_TOKEN on unpair so a previously-paired phone cannot
+    keep streaming after the user explicitly unpaired it. Without rotation
+    the old phone retained access until next reboot — defeating the whole
+    point of "unpair this device". All previously-paired clients now get
+    401 and must re-pair via /api/pair (which mints a fresh token).
+    """
     if not _check_any_token(_extract_token(request, token)):
         return Response(status_code=401)
     if not _pair_locked:
         return JSONResponse({"status": "already_unlocked"})
     _set_pair_lock(False)
-    log_info(f"UNPAIRED by {request.client.host} — pairing UNLOCKED")
+    # S12: rotate master AUTH_TOKEN. Persist via _save_config so it survives
+    # restart. Also wipe any per-client sessions that were stamped with the
+    # old token — they'll fail _verify_session on next call regardless, but
+    # explicit cleanup avoids surprise audit-log entries from a stale token
+    # still claiming to be authenticated.
+    global AUTH_TOKEN
+    new_token = secrets.token_urlsafe(32)
+    AUTH_TOKEN = new_token
+    with _config_lock:
+        config = _load_config()
+        config["auth_token"] = new_token
+        _save_config(config)
+    with _sessions_lock:
+        _client_sessions.clear()
+        _mark_sessions_dirty()
+    log_info(f"UNPAIRED by {request.client.host} — pairing UNLOCKED + auth token rotated")
     return JSONResponse({"status": "unpaired"})
 
 @app.get("/api/token-check")
@@ -3570,9 +4204,15 @@ async def blink_screen(request: Request, token: str = Query(None)):
     if not _check_any_token(_extract_token(request, token)):
         return Response(status_code=401)
     global _blink_active
-    if _blink_active:
-        return {"status": "already_blinking"}
-    _blink_active = True
+    # H10: serialize check-and-set so two concurrent POSTs cannot both observe
+    # _blink_active==False, both flip it to True, and double-fire the blink
+    # thread. (The race window is small but real — uvicorn schedules
+    # concurrent handlers freely on the asyncio loop, and `if _blink_active:
+    # ... _blink_active = True` is two distinct event-loop ticks.)
+    with _blink_lock:
+        if _blink_active:
+            return {"status": "already_blinking"}
+        _blink_active = True
     loop = asyncio.get_event_loop()
     # A9-P3-2: Track the executor future so _blink_active always resets (already in finally,
     # but this ensures exceptions don't silently disappear). Fire-and-forget is acceptable here
@@ -3844,7 +4484,15 @@ _admin_update_lock = asyncio.Lock()
 
 @app.post("/api/admin/update")
 async def api_admin_update(request: Request, token: str = Query(None)):
-    """Pull latest code from git and self-restart if changed."""
+    """Pull latest code from git and self-restart if changed.
+
+    Auth: requires BOTH a valid session token (master AUTH_TOKEN or paired
+    session) AND the `X-Admin-Token` header matching `admin_password_hash`
+    in config.json. R1: a leaked phone-pair token is NOT sufficient — this
+    endpoint runs `git reset --hard` + `pip install` + restart, which is
+    arbitrary code execution as the server user.
+
+    See _get_admin_password_hash() docstring for the operator setup flow."""
     # P0-2: Restrict to localhost only — this endpoint runs git reset + pip install + restart
     client_ip = request.client.host
     if client_ip not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
@@ -3854,52 +4502,81 @@ async def api_admin_update(request: Request, token: str = Query(None)):
     if not _verify_session(_extract_token(request, token)):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
+    # R1: second-factor — admin password hash, separate from app/pair token.
+    # Refuse with 503 if not configured so a fresh install cannot be
+    # exploited just by leaking the phone-pair token.
+    if not _get_admin_password_hash():
+        log_warning(f"[API] admin/update attempted from {client_ip} but admin_password_hash not configured")
+        return JSONResponse(
+            {"error": "admin not configured — set admin_password_hash in config.json"},
+            status_code=503,
+        )
+    admin_token = request.headers.get("x-admin-token", "")
+    if not _verify_admin_token(admin_token):
+        log_warning(f"[API] admin/update bad X-Admin-Token from {client_ip}")
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
     if _admin_update_lock.locked():
         return JSONResponse({"error": "Update already in progress"}, status_code=409)
 
     async with _admin_update_lock:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         install_dir = os.path.dirname(script_dir)  # parent of src/
+        loop = asyncio.get_event_loop()
+
+        # H5: subprocess.run blocks the event loop — wrap each call in
+        # run_in_executor so a 30 s git fetch / 120 s pip install can't stall
+        # WebSocket heartbeats and audio frame delivery for other clients.
+        def _run(cmd, **kw):
+            return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
         try:
             # Get current HEAD
-            old_head = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=install_dir, capture_output=True, text=True, timeout=10
-            ).stdout.strip()
+            old_head = (await loop.run_in_executor(
+                io_executor,
+                lambda: _run(["git", "rev-parse", "HEAD"], cwd=install_dir, timeout=10),
+            )).stdout.strip()
 
             # Detect default branch (master or main)
-            branch_result = subprocess.run(
-                ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
-                cwd=install_dir, capture_output=True, text=True, timeout=10
+            branch_result = await loop.run_in_executor(
+                io_executor,
+                lambda: _run(
+                    ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+                    cwd=install_dir, timeout=10,
+                ),
             )
             branch = "master"  # fallback
             if branch_result.returncode == 0 and branch_result.stdout.strip():
                 branch = branch_result.stdout.strip().split("/")[-1]
 
             # Fetch
-            fetch = subprocess.run(
-                ["git", "fetch", "origin"],
-                cwd=install_dir, capture_output=True, text=True, timeout=30
+            fetch = await loop.run_in_executor(
+                io_executor,
+                lambda: _run(["git", "fetch", "origin"], cwd=install_dir, timeout=30),
             )
             if fetch.returncode != 0:
-                log_error(f"[API] git fetch failed: {fetch.stderr}")
+                # H16: include stderr in the log so the operator has the actual
+                # git error (network down, auth, conflict) without rummaging.
+                log_error(f"[API] git fetch failed: {fetch.stderr.strip()}")
                 return JSONResponse({"error": "Git fetch failed"}, status_code=500)
 
             # Reset to remote branch
-            reset = subprocess.run(
-                ["git", "reset", "--hard", f"origin/{branch}"],
-                cwd=install_dir, capture_output=True, text=True, timeout=10
+            reset = await loop.run_in_executor(
+                io_executor,
+                lambda: _run(
+                    ["git", "reset", "--hard", f"origin/{branch}"],
+                    cwd=install_dir, timeout=10,
+                ),
             )
             if reset.returncode != 0:
-                log_error(f"[API] git reset failed: {reset.stderr}")
+                log_error(f"[API] git reset failed: {reset.stderr.strip()}")
                 return JSONResponse({"error": "Git reset failed"}, status_code=500)
 
             # Get new HEAD
-            new_head = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=install_dir, capture_output=True, text=True, timeout=10
-            ).stdout.strip()
+            new_head = (await loop.run_in_executor(
+                io_executor,
+                lambda: _run(["git", "rev-parse", "HEAD"], cwd=install_dir, timeout=10),
+            )).stdout.strip()
 
             if old_head and new_head and old_head != new_head:
                 log_info(f"[API] admin/update: code updated {old_head[:8]}→{new_head[:8]}, installing deps + restarting...")
@@ -3910,9 +4587,12 @@ async def api_admin_update(request: Request, token: str = Query(None)):
                     venv_pip = os.path.join(install_dir, "venv", "Scripts", "pip.exe")
                 req_file = os.path.join(install_dir, "requirements.txt")
                 if os.path.exists(venv_pip) and os.path.exists(req_file):
-                    pip_result = subprocess.run(
-                        [venv_pip, "install", "-r", req_file, "-q"],
-                        cwd=install_dir, capture_output=True, text=True, timeout=120
+                    pip_result = await loop.run_in_executor(
+                        io_executor,
+                        lambda: _run(
+                            [venv_pip, "install", "-r", req_file, "-q"],
+                            cwd=install_dir, timeout=120,
+                        ),
                     )
                     # A9-P2-7: Log warning on pip failure but proceed with restart
                     # (code was already updated; deps may already be satisfied)
@@ -3930,8 +4610,11 @@ async def api_admin_update(request: Request, token: str = Query(None)):
                 return {"status": "up_to_date", "old_head": old_head[:8], "new_head": new_head[:8]}
 
         except Exception as e:
-            # A9-P2-8: Log full error server-side but don't leak internals to client
-            log_error(f"[API] admin/update failed: {e}")
+            # A9-P2-8: Log full error server-side but don't leak internals to client.
+            # H16: log full traceback so the operator has the failure mode without
+            # asking the user to repro. Falls back to logging.error directly because
+            # the log_error helper wraps a single-arg getLogger().error call.
+            logging.error(f"[API] admin/update failed: {e}", exc_info=True)
             return JSONResponse({"error": "Update failed — check server logs"}, status_code=500)
 
 @app.post("/api/password/set")
@@ -3992,16 +4675,24 @@ async def api_version():
     """
     git_hash = "unknown"
     try:
-        import subprocess
+        # H5: subprocess.run blocks the event loop. Even at 2 s timeout this
+        # could stall a busy server during a slow disk read on the .git tree.
+        loop = asyncio.get_event_loop()
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=repo_root, capture_output=True, text=True, timeout=2
+        result = await loop.run_in_executor(
+            io_executor,
+            lambda: subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=repo_root, capture_output=True, text=True, timeout=2,
+            ),
         )
         if result.returncode == 0:
             git_hash = result.stdout.strip() or "unknown"
-    except Exception:
-        pass
+    except Exception as e:
+        # H16: silent except hid the actual failure mode (eg. wrong cwd, no
+        # .git, exec timeout). Use logging.debug directly so we can pass
+        # exc_info — log_debug helper wraps a single-arg getLogger().debug.
+        logging.debug(f"[API] /api/version git hash lookup failed: {e}", exc_info=True)
     return {
         "version": _SERVER_VERSION,
         "git": git_hash,
@@ -4061,18 +4752,56 @@ async def api_license_status(request: Request, token: str = Query(None)):
     """Report the currently installed license — if any.
 
     Response shape:
-        { "active": bool, "track": str|None, "email": str|None,
-          "license_id": str|None, "issued_at": int|None }
+        {
+          "active": bool,
+          "track": str|None,           # license claim — None when no license
+          "email": str|None,
+          "license_id": str|None,
+          "issued_at": int|None,
+          "client_kind": str|None,     # what this caller declared (or defaulted)
+          "effective_track_for_this_client": str|None,
+        }
 
-    `active=false` with everything else None means the server is at free
-    tier (no license installed, or an installed license failed to verify
-    and has been ignored). This endpoint NEVER returns 500 for a license
-    problem — license issues are never the reason the server stops
-    working.
+    `effective_track_for_this_client` is the license track unlocked FOR THE
+    SPECIFIC CALLER by the currently installed license — None when free
+    tier applies to this caller. An android caller sees:
+        no license           -> null (free tier)
+        phone license        -> "phone"
+        desktop license      -> null (track mismatch — still free tier for them)
+        bundle license       -> "both"
+    A web caller always gets null (browser clients never unlock paid features
+    regardless of which license is installed, per MONETIZATION.md).
+
+    Invalid `X-Client-Kind` → HTTP 400 (don't silently default: a tampered
+    client might try to pass `desktop` as a bogus value to probe which
+    licenses unlock). Missing header → defaults to `web`.
+
+    `active=false` with track/email/license_id/issued_at all None means the
+    server is at free tier globally (no license installed or installed
+    license failed to verify). This endpoint NEVER returns 500 for a
+    license problem — license issues are never the reason the server
+    stops working.
     """
     if (err := _require_auth(request, token)):
         return err
+
+    client_kind = _client_kind_from_headers(request.headers)
+    if client_kind is None:
+        return JSONResponse(
+            {"error": "invalid X-Client-Kind header",
+             "allowed": sorted(VALID_CLIENT_KINDS)},
+            status_code=400,
+        )
+
     lic = license_core.get_active_license()
+
+    # Derive effective track: only non-null when the installed license
+    # actually covers this caller's track.
+    if lic is None or not _has_license_for_client(client_kind):
+        effective = None
+    else:
+        effective = lic.track  # "phone", "desktop", or "both"
+
     if lic is None:
         return {
             "active": False,
@@ -4080,6 +4809,8 @@ async def api_license_status(request: Request, token: str = Query(None)):
             "email": None,
             "license_id": None,
             "issued_at": None,
+            "client_kind": client_kind,
+            "effective_track_for_this_client": effective,
         }
     return {
         "active": True,
@@ -4087,12 +4818,33 @@ async def api_license_status(request: Request, token: str = Query(None)):
         "email": lic.email,
         "license_id": lic.license_id,
         "issued_at": lic.issued_at,
+        "client_kind": client_kind,
+        "effective_track_for_this_client": effective,
     }
 
 
 @app.post("/api/license-install")
-async def api_license_install(request: Request, token: str = Query(None)):
+async def api_license_install(
+    request: Request,
+    token: str = Query(None),
+    install_token: str = Query(None),
+):
     """Install a new license key (body: {"key": "SKT-..."}).
+
+    L4: the master AUTH_TOKEN alone is no longer sufficient when the server
+    has any provisioned install_tokens. Caller MUST present
+    `?install_token=<one-shot>` matching a record populated by the payment
+    webhook (see license/issuer.py). Token is single-use: marked consumed on
+    successful install. The installed key's email MUST match the token's
+    bound email — defense against token+key mix-ups across customers.
+
+    Forward-compat: if install_tokens is empty (no payment integration yet),
+    fall back to old behavior (auth token only) with a log warning. This
+    keeps the offline-license install path functional for engineering /
+    ops while Worktree A wires up the issuance flow.
+
+    Coordinated with license/issuer.py: install_tokens table populated by
+    webhook on payment.captured.
 
     Idempotent: posting the same key twice leaves the same file on disk
     and returns the same response. Posting a DIFFERENT valid key
@@ -4100,6 +4852,34 @@ async def api_license_install(request: Request, token: str = Query(None)):
     a crash mid-install doesn't corrupt the existing license)."""
     if (err := _require_auth(request, token)):
         return err
+
+    install_tokens = _get_install_tokens()
+    token_record: "dict | None" = None
+    if install_tokens:
+        # Production path — at least one token has been provisioned, so we
+        # require every install to come with one.
+        if not install_token:
+            return JSONResponse(
+                {"error": "install_token query param required"}, status_code=400
+            )
+        # Look up without consuming yet — we want to validate the key parses
+        # AND matches the token's email before marking consumed.
+        rec = install_tokens.get(install_token)
+        if not isinstance(rec, dict) or rec.get("consumed_at"):
+            log_warning(
+                f"[License] install_token rejected from {request.client.host}: "
+                f"unknown or already-consumed token"
+            )
+            return JSONResponse(
+                {"error": "install_token invalid or already used"}, status_code=403
+            )
+        token_record = rec
+    else:
+        log_warning(
+            "[License] install_tokens store empty — accepting install with master "
+            "auth only (greenfield mode). Provision tokens via the payment webhook "
+            "to enable email-bound enforcement."
+        )
 
     try:
         body = await request.json()
@@ -4123,6 +4903,33 @@ async def api_license_install(request: Request, token: str = Query(None)):
         return JSONResponse(
             {"error": "license install failed"}, status_code=500
         )
+
+    # L4: enforce email binding AFTER successful key parse. The license is on
+    # disk by now (license_core.install_license_key wrote atomically) — but
+    # we still consume the token so the operator can see "installed; email
+    # mismatch" in logs and re-issue cleanly. Mismatch returns 403.
+    if token_record is not None:
+        bound_email = token_record.get("email")
+        consumed = _consume_install_token(install_token)
+        if consumed is None:
+            # Race: someone else consumed the token between our lookup and
+            # consume call. Reject the install.
+            log_warning(
+                f"[License] install_token {install_token[:8]}... consumed "
+                f"between check and use; rejecting install"
+            )
+            return JSONResponse(
+                {"error": "install_token invalid or already used"}, status_code=403
+            )
+        if isinstance(bound_email, str) and bound_email and lic.email != bound_email:
+            log_warning(
+                f"[License] email mismatch: token bound to {bound_email!r}, "
+                f"key bound to {lic.email!r}"
+            )
+            return JSONResponse(
+                {"error": "license email does not match install_token"},
+                status_code=403,
+            )
 
     return {
         "active": True,
@@ -4178,6 +4985,11 @@ async def api_vocab_replace(request: Request, token: str = Query(None)):
         return JSONResponse({"error": "body.entries must be a list"}, status_code=400)
     try:
         data = vocab_store.get_default_store().replace_all(entries)
+        # F1: bump generation so active sessions refresh their cached hotwords
+        # on the next transcribe call. No locking — single-writer pattern is
+        # fine for a monotonic counter.
+        global _vocab_generation
+        _vocab_generation += 1
         return data
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -4200,7 +5012,10 @@ async def api_vocab_patch(request: Request, token: str = Query(None)):
     if not isinstance(add, list) or not isinstance(remove, list):
         return JSONResponse({"error": "add and remove must be lists"}, status_code=400)
     try:
-        return vocab_store.get_default_store().patch(add=add, remove=remove)
+        result = vocab_store.get_default_store().patch(add=add, remove=remove)
+        global _vocab_generation
+        _vocab_generation += 1
+        return result
     except Exception as e:
         log_error(f"[Vocab] PATCH failed: {e}")
         return JSONResponse({"error": "vocab patch failed"}, status_code=500)
@@ -4215,6 +5030,8 @@ async def api_vocab_delete(text: str, request: Request, token: str = Query(None)
         removed = vocab_store.get_default_store().remove_entry(text)
         if not removed:
             return JSONResponse({"error": "not found"}, status_code=404)
+        global _vocab_generation
+        _vocab_generation += 1
         return {"status": "ok", "text": text}
     except Exception as e:
         log_error(f"[Vocab] DELETE failed: {e}")
@@ -4254,10 +5071,18 @@ async def api_accent_calibrate(
                 except ValueError:
                     sample_rate = None
         try:
-            meta = accent_store.get_default_store().save_profile(
-                data,
-                sample_rate=sample_rate,
-                client_name=client_name,
+            # H13: save_profile runs librosa feature extraction synchronously —
+            # 100-500ms on a typical audio sample, more on slower hosts. Move it
+            # to the IO executor so a calibration POST can't stall the event
+            # loop and starve concurrent WS audio frames.
+            loop = asyncio.get_event_loop()
+            meta = await loop.run_in_executor(
+                io_executor,
+                lambda: accent_store.get_default_store().save_profile(
+                    data,
+                    sample_rate=sample_rate,
+                    client_name=client_name,
+                ),
             )
         except ValueError as ve:
             return JSONResponse({"error": str(ve)}, status_code=400)

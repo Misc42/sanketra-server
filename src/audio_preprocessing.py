@@ -271,8 +271,11 @@ def preprocess_audio_frame(
     if preserve_original_energy and config.preserve_vad_energy:
         processed = normalize_energy(original_audio, processed)
 
-    # Soft limiting (tanh-based — avoids hard clip odd harmonics)
-    processed = np.tanh(processed)
+    # AU-VAD-1: tanh soft-limiter removed from VAD path. tanh compresses
+    # dynamic range, flattening the signal Silero VAD sees and reducing its
+    # ability to discriminate speech onsets from noise. Mic input is already
+    # bounded to ~[-1,1] and the HPF + normalize_energy chain preserves that.
+    # If a transient overshoots, the downstream VAD handles it fine.
 
     return processed
 

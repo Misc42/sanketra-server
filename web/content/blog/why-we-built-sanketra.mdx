@@ -1,0 +1,38 @@
+---
+title: "Why we built Sanketra"
+date: "2026-04-20"
+excerpt: "Hindi typing on PC is still broken. Sanketra is my answer: local voice, phone-as-mic, and zero cloud STT."
+slug: "why-we-built-sanketra"
+---
+
+Hindi typing on a PC is one of those problems everyone has quietly accepted as normal. It is not normal. It is a design failure that got buried under jugaad.
+
+If you write in English, the keyboard is your home ground. Muscle memory is already there. Forty words per minute is casual. If you write in Devanagari, suddenly the same machine becomes hostile. Joint letters, matras, transliteration guesses, IME modes, autocorrect doing nautanki, and that constant feeling that the sentence in your head is faster than the interface in front of you.
+
+Phone pe Hindi feels better. That is the weird part. Gboard voice typing is genuinely good. The tiny glass keyboard is annoying, but at least the phone understands the way we actually speak: Hindi, English, Hinglish, brand names, half-sentences, pauses. On PC, the place where real work happens, Hindi input still feels like a side quest.
+
+This gap bothered me more than it should have. Not because dictation is new. Dictation is ancient. Dragon did it. Otter does meetings. Every productivity app now has some "AI notes" checkbox. But all of them miss the actual Indian PC problem.
+
+The problem is not "record my meeting and summarize it later." The problem is: I am staring at a text box right now, in WhatsApp Web, Gmail, ChatGPT, Cursor, Notion, a government form, anywhere, and I want the sentence in my head to appear there without fighting the keyboard.
+
+Sanketra is built for that moment.
+
+Your phone becomes the mic because proximity matters. Laptop microphones are usually far away, angled badly, and sitting next to fan noise. In Indian homes, offices, hostels, and cafes, noise is not an edge case. It is the default environment. A phone near your mouth gives cleaner audio than a laptop across the table. Better signal beats clever post-processing.
+
+The PC does the speech-to-text locally. That part is non-negotiable. Your voice should not go to some cloud server just because you wanted to type "kal ka invoice bhej dena" into a text box. Sanketra runs on your local Wi-Fi. Phone sends audio to your PC. PC runs Whisper. PC injects text into the focused field. बस.
+
+No account. No telemetry. No cloud STT. No hidden server where your voice is quietly becoming somebody else's training data. If your Wi-Fi is on and your PC is running, Sanketra works. If the internet dies, Sanketra should still work. That is the bar.
+
+This also changes the pricing math. Cloud speech-to-text makes every minute a cost center. That pushes products toward US-style subscriptions, usage limits, and "team plans" that make no sense for most Indian users. Local Whisper flips the economics. The expensive machine is already on your desk. Use it. That is how you can have a real free tier, a ₹99 monthly option, and a ₹1,499 lifetime plan without pretending India will happily pay SaaS rent forever.
+
+Sanketra is also not a Dragon clone. Dragon was dictation as a separate world: training, profiles, command grammars, heavyweight desktop software. Sanketra is a thin layer over the PC you already use. Speak into the current app. Move the cursor from the phone. Mirror the screen when you are on the couch. Pair with a four-digit code. Keep the whole thing local.
+
+It is not an Otter clone either. Otter wants your meeting. Sanketra wants your input field. Very different product. We are not trying to create a searchable archive of every word you say. We are trying to make voice a universal input layer for the PC, especially for people whose first language does not map cleanly to a QWERTY keyboard.
+
+The Devanagari pain is the wedge, but the larger idea is simpler: computers should accept the fastest input you can provide in the moment. Sometimes that is the keyboard. Sometimes it is the mouse. Sometimes it is a phone acting as a trackpad from the bed. Sometimes it is your voice, because the thought is already formed and typing it would only slow it down.
+
+Hindi users have been trained to compromise: type English because Hindi is slow, use transliteration because native script is painful, switch to the phone because the PC does not understand you, or send voice notes because text is too much effort. I do not think that compromise is permanent. It is just what happens when nobody builds the boring plumbing.
+
+The boring plumbing is the product: LAN discovery, pair codes, cert pinning, local inference, input injection, phone audio, trackpad, screen mirror, installation that normal people can survive. None of this is glamorous. All of it matters.
+
+Sanketra exists because the sentence should not die between your mouth and the text box. बोलो. PC सुन लेगा.

@@ -114,6 +114,15 @@ _active_trackpad_ws = 0
 _active_screen_ws = 0
 _active_audio_out_ws = 0
 
+# Whisper inference counter, monotonic since process start. Bumped from
+# `transcribe_sync` after we've decided to actually run the model (i.e. past
+# the model-loaded + min-duration guard). Read by the /metrics endpoint as
+# `sanketra_server_total_inferences_total`. Lives behind its own lock — the
+# pre-existing `_whisper_lock` is held during the model swap and we don't
+# want to share contention with model loading.
+_inference_count = 0
+_inference_count_lock = threading.Lock()
+
 # Dashboard push channel — real-time transcripts to /dashboard clients.
 # Set of WebSocket instances accepted on /ws-dashboard. Mutated only from the
 # asyncio loop, so no lock needed. Broadcasts are best-effort: a dead socket
@@ -762,6 +771,22 @@ def _reset_usage_for_tests() -> None:
     _usage_lock = None
 
 
+def _get_inference_count() -> int:
+    """Read-only counter for /metrics + tests. Holds `_inference_count_lock`
+    so a torn read on 32-bit interpreters is impossible (CPython 64-bit ints
+    are technically safe, but the lock costs ~50ns and keeps the contract
+    explicit)."""
+    with _inference_count_lock:
+        return _inference_count
+
+
+def _reset_inference_count_for_tests() -> None:
+    """Zero the inference counter so each test starts from a known baseline."""
+    global _inference_count
+    with _inference_count_lock:
+        _inference_count = 0
+
+
 def _ensure_usage_lock() -> "asyncio.Lock":
     """Lazily create `_usage_lock`. Tests skip the lifespan handler (they use
     TestClient without the `with` form), so the lock must be creatable on
@@ -995,6 +1020,14 @@ def transcribe_sync(
         return "", ""
     if len(audio) < int(SAMPLE_RATE * 0.25):  # Min 250ms
         return "", ""
+
+    # Past both guards — we're committed to actually running the model.
+    # Bump the metrics counter exactly once per inference attempt so the
+    # /metrics scrape can chart QPS. Ignored failures count too: an
+    # exception below still consumed GPU time.
+    global _inference_count
+    with _inference_count_lock:
+        _inference_count += 1
 
     # F1: hotwords cached per-session, refreshed only when _vocab_generation
     # bumps. Read the global once into a local — the read is atomic (PEP 3119),
@@ -4734,6 +4767,94 @@ async def api_health(request: Request, token: str = Query(None)):
         "input_guard": _input_guard_enabled,
         "service_mode": _SERVICE_MODE,
     }
+
+
+@app.get("/metrics")
+async def metrics() -> PlainTextResponse:
+    """Prometheus-format metrics endpoint.
+
+    Plain-text exposition (no `prometheus-client` dep — the body is built by
+    hand the same way `license/issuer.py:metrics()` does it). Six gauges /
+    counters surface PC-server health:
+
+    - `sanketra_server_active_ws_count` (gauge) — open WS connections across
+      every channel (audio-in, trackpad, screen, audio-out). A LAN dictation
+      session typically holds 2-3.
+    - `sanketra_server_total_inferences_total` (counter) — Whisper
+      transcriptions performed since process start. Useful for QPS charts.
+    - `sanketra_server_license_active` (gauge, 0/1) — 1 when a verified
+      license is installed; 0 on free tier or any verifier failure.
+    - `sanketra_server_free_tier_minutes_used` (gauge) — sum of this UTC
+      month's free-tier minutes across all client kinds. Compare against
+      `FREE_TIER_MONTHLY_MINUTES` to alert at 80%.
+    - `sanketra_server_uptime_seconds` (gauge) — wall-clock seconds since
+      module import. Pair with version label for restart detection.
+    - `sanketra_server_pair_locked` (gauge, 0/1) — 1 once a phone has
+      successfully paired; 0 on a fresh / unpaired install.
+
+    Auth: NONE — the LAN-only Origin allowlist + RFC 1918 middleware already
+    fence this off the public internet, and the body contains no secrets
+    (no token, no signing key, no pair code).
+
+    Robustness: every read is wrapped — the license verifier may be cold,
+    the usage state may not have been touched yet, and a fresh install may
+    have neither file present. Each fallback evaluates to a numeric value
+    so a Prometheus scrape never sees `NaN` or a 500.
+    """
+    # WS gauge — sum of all four counters. `_active_audio_ws` is a set
+    # protected by `_ws_track_lock`; the others are int counters without
+    # locks (single-writer per WS handler is the existing invariant).
+    with _ws_track_lock:
+        audio_ws = len(_active_audio_ws)
+    active_ws = audio_ws + _active_trackpad_ws + _active_screen_ws + _active_audio_out_ws
+
+    # License — `get_active_license()` is documented to never raise, but
+    # belt-and-braces in case the license module fails to import (e.g.
+    # cryptography wheel missing on a stripped install).
+    license_active = 0
+    try:
+        if license_core.get_active_license() is not None:
+            license_active = 1
+    except Exception:
+        license_active = 0
+
+    # Free-tier minutes — sum across client kinds. Read via the async helper
+    # so we hit the same lazy-load + month-rollup path as the gating code
+    # (consistent reads vs. the gate). Falls back to 0 on any error.
+    free_tier_minutes = 0.0
+    try:
+        state = await _usage_get_state()
+        lock = _ensure_usage_lock()
+        async with lock:
+            free_tier_minutes = float(sum(state["minutes_used"].values()))
+    except Exception:
+        free_tier_minutes = 0.0
+
+    uptime_s = max(0, int(time.time() - _SERVER_START_TIME))
+    pair_locked_int = 1 if _pair_locked else 0
+    inferences_total = _get_inference_count()
+
+    body = (
+        "# HELP sanketra_server_active_ws_count Currently open WebSocket connections (audio-in + trackpad + screen + audio-out).\n"
+        "# TYPE sanketra_server_active_ws_count gauge\n"
+        f"sanketra_server_active_ws_count {active_ws}\n"
+        "# HELP sanketra_server_total_inferences_total Whisper transcriptions executed since process start.\n"
+        "# TYPE sanketra_server_total_inferences_total counter\n"
+        f"sanketra_server_total_inferences_total {inferences_total}\n"
+        "# HELP sanketra_server_license_active 1 if a verified license is installed, 0 otherwise.\n"
+        "# TYPE sanketra_server_license_active gauge\n"
+        f"sanketra_server_license_active {license_active}\n"
+        "# HELP sanketra_server_free_tier_minutes_used Free-tier audio minutes used this UTC month, summed across client kinds.\n"
+        "# TYPE sanketra_server_free_tier_minutes_used gauge\n"
+        f"sanketra_server_free_tier_minutes_used {free_tier_minutes:.4f}\n"
+        "# HELP sanketra_server_uptime_seconds Seconds since the server module was imported.\n"
+        "# TYPE sanketra_server_uptime_seconds gauge\n"
+        f"sanketra_server_uptime_seconds {uptime_s}\n"
+        "# HELP sanketra_server_pair_locked 1 if a phone has paired (further pairing rejected), 0 if open to first pair.\n"
+        "# TYPE sanketra_server_pair_locked gauge\n"
+        f"sanketra_server_pair_locked {pair_locked_int}\n"
+    )
+    return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
 
 
 # =============================================================================

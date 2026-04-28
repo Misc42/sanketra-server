@@ -2309,8 +2309,9 @@ def init_models(preference="balanced", direct_model=None, verbose=True):
     # in BOTH modes. Previously nested inside `if _SERVICE_MODE:` which meant
     # legacy startup silently lost session persistence (every _mark_sessions_dirty
     # no-op'd because the writer never spun up).
+    # Writer task spawn moved to lifespan — needs a running event loop, which
+    # init_models (module-level) doesn't have.
     _load_client_sessions()
-    _start_sessions_writer()
 
     if _SERVICE_MODE:
         # Service mode: start IDLE, no model loaded, load on-demand via API
@@ -2643,6 +2644,7 @@ async def lifespan(app: FastAPI):
     _model_load_lock = asyncio.Lock()
     _pair_mutex = asyncio.Lock()
     # _usage_lock lazily created by _ensure_usage_lock(); tests skip lifespan.
+    _start_sessions_writer()
 
     # N-P0-1: Schedule TCP_NODELAY after uvicorn binds sockets (deferred to next tick)
     _event_loop.call_soon(_set_tcp_nodelay_on_server)
